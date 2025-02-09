@@ -1,4 +1,5 @@
 import logging
+import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from onvif.exceptions import ONVIFError
@@ -252,6 +253,20 @@ def apply_transformation():
             # Apply 75% main + 25% others (stacked) layout
             obs_client.update_obs_layout(scene_name="Mosaic", active_source=active_source)
         return jsonify({"success": f"Applied transformation: {transformation_type}"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+# =========================
+# Route: Reconnect to OBS
+# =========================
+@app.route("/obs/reconnect", methods=["POST"])
+def reconnect_to_obs():
+    try:
+        obs_client.close();
+        # Wait for 1 second before reconnecting
+        time.sleep(5);
+        obs_client.connect();
+        return jsonify({"success": "Reconnected to OBS WebSocket"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

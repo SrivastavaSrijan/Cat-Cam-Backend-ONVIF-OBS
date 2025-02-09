@@ -225,6 +225,7 @@ class OBSWebSocketClient:
             elif op == 2:  # Identified
                 self.connected = True
                 self.start_keep_alive()
+                self.start_refresh_thread();
                 logging.info("Connected and identified with OBS WebSocket.")
             elif op == 7:  # RequestResponse
                 self.handle_request_response(response)
@@ -424,3 +425,57 @@ class OBSWebSocketClient:
         except Exception as ex:
             logging.error(f"An unexpected error occurred during layout update: {str(ex)}")
             self.reconnect_if_needed()
+
+
+
+    def start_refresh_thread(self):
+        """
+        Starts the refresh_sources function in a background thread if not already running.
+        Ensures only one thread exists to prevent duplicate toggling.
+        """
+        with self._lock:
+            if hasattr(self, "refresh_thread") and self.refresh_thread and self.refresh_thread.is_alive():
+                logging.info("Refresh thread is already running. Skipping new thread creation.")
+                return
+
+            self.refresh_thread_running = True
+            self.refresh_thread = threading.Thread(target=self._refresh_sources_loop, daemon=True)
+            self.refresh_thread.start()
+            logging.info("Refresh thread started successfully.")
+
+    def stop_refresh_thread(self):
+        """
+        Stops the refresh_sources thread gracefully.
+        """
+        with self._lock:
+            self.refresh_thread_running = False
+
+        if hasattr(self, "refresh_thread") and self.refresh_thread and self.refresh_thread.is_alive():
+            self.refresh_thread.join(timeout=5)
+            logging.info("Refresh thread stopped.")
+
+    def _refresh_sources_loop(self):
+        """
+        Continuously toggles visibility for all sources every 30 seconds,
+        making them invisible for 100ms before restoring visibility.
+        """
+        while self.refresh_thread_running:
+          
+            try:
+                # Make the source invisible
+                self.switch_scene("Please Wait")
+                logging.info(f"Temporarily hid Mosaic")
+
+                # Wait for 3s before restoring visibility
+                time.sleep(3)
+
+                # Make the source visible again
+                self.switch_scene("Mosaic")
+                logging.info(f"Restored visibility for Mosaic")
+
+            except Exception as e:
+                logging.error(f"Failed to toggle visibility for Mosaic: {e}")
+
+            # Wait for 2.5 mins before toggling again
+            time.sleep(60 * 2.5)
+

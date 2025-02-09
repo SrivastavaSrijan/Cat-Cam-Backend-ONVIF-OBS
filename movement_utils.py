@@ -138,7 +138,6 @@ class ONVIFCameraInstance:
         if self._active:
             self._ptz.Stop({'ProfileToken': self._media_profile.token})
         self._active = True
-        self.get_status()
         self._ptz.AbsoluteMove(self._positionrequest)
 
     def move_up(self):
