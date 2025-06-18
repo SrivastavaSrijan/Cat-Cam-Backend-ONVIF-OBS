@@ -20,22 +20,46 @@ process = None
 obs_client = OBSWebSocketClient(OBS_URL, OBS_PASSWORD)
 log_file_path="motion_detection.log"
 
+print("🚀 Starting Enhanced ONVIF Camera Control System...")
+
 if not (obs_client.connect()):
     logging.error("Could not connect to OBS WebSocket")
+    print("⚠️  OBS WebSocket connection failed - OBS features will not be available")
+else:
+    print("✅ OBS WebSocket connected successfully")
 
-
-
+print("\n📹 Initializing cameras...")
 camera_manager = ONVIFCameraManager()
 camera_manager.initialize_cameras(CAMERA_CONFIGS)
 
+# Check how many cameras were successfully initialized
+initialized_count = len(camera_manager.cameras)
+total_count = len(CAMERA_CONFIGS)
+print(f"\n📊 Camera initialization complete: {initialized_count}/{total_count} cameras online")
+
+if initialized_count == 0:
+    print("⚠️  WARNING: No cameras were successfully initialized!")
+    print("   - Check camera network connectivity")
+    print("   - Verify ONVIF credentials in shared_config.py")
+    print("   - Ensure cameras support ONVIF protocol")
+else:
+    print("✅ Camera system ready!")
+    for nickname in camera_manager.cameras.keys():
+        print(f"   - {nickname}: Online")
+
+print("\n🌐 Starting Flask web server...")
+print("   API will be available at: http://localhost:5000")
+print("   Use Ctrl+C to stop the server")
+print("-" * 50)
+
 @app.route("/ptz/switch_camera", methods=["POST"])
 def switch_camera():
-    data = request.json
+    data = request.json or {}
     nickname = data.get("nickname")
     if not nickname:
         return jsonify({"error": "Nickname is required"}), 400
     try:
-        def operation(camera:ONVIFCameraInstance):
+        def operation(camera: ONVIFCameraInstance):
             return {"success": f"Switched to {nickname}, {camera.host}"}
         result = camera_manager.perform_operation(nickname, operation)
         return jsonify(result), 200
@@ -48,12 +72,20 @@ def status():
     if not nickname:
         return jsonify({"error": "Nickname is required"}), 400
     try:
-        def operation(camera:ONVIFCameraInstance):
-            return camera.get_status()
+        def operation(camera: ONVIFCameraInstance):
+            # Use the safe status method first
+            safe_status = camera.get_status_safe()
+            if not safe_status.get("online", False):
+                return safe_status
+            # If camera is online, get detailed status
+            try:
+                return camera.get_status()
+            except Exception:
+                # Return the safe status if detailed status fails
+                return safe_status
+        
         result = camera_manager.perform_operation(nickname, operation)
         return jsonify(result), 200
-    except ONVIFError as e:
-        return jsonify({"error": f"ONVIFError: {str(e)}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -72,18 +104,15 @@ def get_all_presets():
 
 @app.route("/ptz/goto_preset", methods=["POST"])
 def goto_preset():
-    data = request.json
+    data = request.json or {}
     nickname = request.args.get("nickname")
     preset_token = data.get("presetToken")
     if not nickname or not preset_token:
         return jsonify({"error": "Both nickname and presetToken are required"}), 400
     try:
-        def operation(camera:ONVIFCameraInstance):
-            camera._ptz.GotoPreset({
-                "ProfileToken": camera._media_profile.token,
-                "PresetToken": preset_token,
-            })
-            return {"message": f"Moved to preset '{preset_token}' successfully!"}
+        def operation(camera: ONVIFCameraInstance):
+            return camera.goto_preset(preset_token)
+        
         result = camera_manager.perform_operation(nickname, operation)
         return jsonify(result), 200
     except ONVIFError as e:
@@ -93,36 +122,24 @@ def goto_preset():
 
 @app.route("/ptz/move", methods=["POST"])
 def move():
-    data = request.json
+    """Quick single tap movement using clean PTZ implementation"""
+    data = request.json or {}
     nickname = request.args.get("nickname")
     direction = data.get("direction")
+    velocity_factor = data.get("velocity_factor", 0.15)  # Small for single taps
+    
     if not nickname or not direction:
         return jsonify({"error": "Both nickname and direction are required"}), 400
+    
     try:
-        def operation(camera:ONVIFCameraInstance):
-            movement_map = {
-                "up": lambda: camera.move_up(),
-                "down": lambda: camera.move_down(),
-                "right": lambda: camera.move_left(),
-                "left": lambda: camera.move_right(),
-                "upright": lambda: camera.move_upleft(),
-                "upleft": lambda: camera.move_upright(),
-                "downright": lambda: camera.move_downleft(),
-                "downleft": lambda: camera.move_downright(),
-                "zoomin": lambda: camera.Zoom_in(),
-                "zoomout": lambda: camera.Zoom_out(),
-            }
-            move_fn = movement_map.get(direction.lower())
-            if not move_fn:
-                raise ValueError("Invalid direction")
-            camera.get_status()
-            move_fn()
-            return {"success": f"Moved {direction}"}
+        def operation(camera: ONVIFCameraInstance):
+            return camera.move_direction(direction, velocity_factor)
+        
         result = camera_manager.perform_operation(nickname, operation)
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
 @app.route("/start_detection", methods=["POST"])
 def start_detection():
     """
@@ -206,7 +223,7 @@ def get_all_scenes():
 @app.route("/obs/current_scene", methods=["GET"])
 def get_current_scene():
     try:
-        current_scene = obs_client()
+        current_scene = obs_client.get_current_scene()
         return jsonify({"current_scene": current_scene}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -217,7 +234,7 @@ def get_current_scene():
 # =========================
 @app.route("/obs/switch_scene", methods=["POST"])
 def switch_scene():
-    data = request.json
+    data = request.json or {}
     scene_name = data.get("scene_name")
 
     if not scene_name:
@@ -235,7 +252,7 @@ def switch_scene():
 # =========================
 @app.route("/obs/transform", methods=["POST"])
 def apply_transformation():
-    data = request.json
+    data = request.json or {}
     obs_client.retrieve_scene_sources("Mosaic")
     transformation_type = data.get("type")
     active_source = data.get("active_source")
@@ -271,5 +288,180 @@ def reconnect_to_obs():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/ptz/movement_speed", methods=["POST"])
+def set_movement_speed():
+    data = request.json or {}
+    nickname = request.args.get("nickname")
+    pan_tilt_speed = data.get("pan_tilt_speed", 0.2)
+    zoom_speed = data.get("zoom_speed", 0.1)
+    
+    if not nickname:
+        return jsonify({"error": "Nickname is required"}), 400
+    
+    # Validate speed values
+    try:
+        pan_tilt_speed = float(pan_tilt_speed)
+        zoom_speed = float(zoom_speed)
+        pan_tilt_speed = max(0.01, min(1.0, pan_tilt_speed))
+        zoom_speed = max(0.01, min(1.0, zoom_speed))
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid speed values"}), 400
+    
+    try:
+        def operation(camera: ONVIFCameraInstance):
+            return camera.set_movement_speed(pan_tilt_speed, zoom_speed)
+        
+        result = camera_manager.perform_operation(nickname, operation)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/ptz/imaging", methods=["GET"])
+def get_imaging_settings():
+    nickname = request.args.get("nickname")
+    if not nickname:
+        return jsonify({"error": "Nickname is required"}), 400
+    
+    try:
+        def operation(camera: ONVIFCameraInstance):
+            return camera.get_imaging_settings()
+        
+        result = camera_manager.perform_operation(nickname, operation)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/ptz/night_mode", methods=["POST"])
+def set_night_mode():
+    data = request.json or {}
+    nickname = request.args.get("nickname")
+    enable = data.get("enable", True)
+    
+    if not nickname:
+        return jsonify({"error": "Nickname is required"}), 400
+    
+    # Validate enable parameter
+    if not isinstance(enable, bool):
+        try:
+            enable = str(enable).lower() in ['true', '1', 'yes', 'on']
+        except:
+            enable = True
+    
+    try:
+        def operation(camera: ONVIFCameraInstance):
+            return camera.set_night_mode(enable)
+        
+        result = camera_manager.perform_operation(nickname, operation)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/ptz/cameras", methods=["GET"])
+def get_cameras():
+    """Get list of all cameras with their status"""
+    try:
+        cameras = []
+        for nickname, camera in camera_manager.cameras.items():
+            if camera:
+                safe_status = camera.get_status_safe()
+                cameras.append({
+                    "nickname": nickname,
+                    "host": safe_status.get("host", "unknown"),
+                    "port": getattr(camera, '_port', 554),  # Default ONVIF port
+                    "status": "online" if safe_status.get("online", False) else "offline",
+                    "error": safe_status.get("error") if not safe_status.get("online", False) else None
+                })
+            else:
+                cameras.append({
+                    "nickname": nickname,
+                    "host": "unknown",
+                    "port": 554,
+                    "status": "offline",
+                    "error": "Camera not initialized"
+                })
+        
+        return jsonify({"cameras": cameras}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/ptz/continuous_move", methods=["POST"])
+def continuous_move():
+    """Start continuous movement using clean PTZ implementation"""
+    data = request.json or {}
+    nickname = request.args.get("nickname")
+    direction = data.get("direction")
+    speed = data.get("speed", 0.6)  # Faster for continuous
+    
+    if not nickname or not direction:
+        return jsonify({"error": "Both nickname and direction are required"}), 400
+    
+    direction_map = {
+        "up": (0.0, speed),
+        "down": (0.0, -speed),
+        "left": (-speed, 0.0),
+        "right": (speed, 0.0),
+    }
+    
+    if direction not in direction_map:
+        return jsonify({"error": f"Invalid direction: {direction}"}), 400
+    
+    pan_speed, tilt_speed = direction_map[direction]
+    
+    try:
+        def operation(camera: ONVIFCameraInstance):
+            return camera.continuous_move(pan_speed, tilt_speed)
+        
+        result = camera_manager.perform_operation(nickname, operation)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/ptz/stop", methods=["POST"])
+def stop_movement():
+    """Stop all PTZ movement using clean implementation"""
+    nickname = request.args.get("nickname")
+    if not nickname:
+        return jsonify({"error": "Nickname is required"}), 400
+    
+    try:
+        def operation(camera: ONVIFCameraInstance):
+            return camera.stop_movement()
+        
+        result = camera_manager.perform_operation(nickname, operation)
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Route: Get Current Transformation
+# =========================
+@app.route("/obs/current_transformation", methods=["GET"])
+def get_current_highlighted_source():
+    """Get the currently highlighted source in the Mosaic scene"""
+    try:
+        scene_name = request.args.get("scene_name", "Mosaic")
+        print(obs_client.current_highlighted_source)
+        # Check if OBS client has a current highlighted source stored
+        if hasattr(obs_client, 'current_highlighted_source') and obs_client.current_highlighted_source:
+            return jsonify({
+                "success": True,
+                "scene_name": scene_name,
+                "highlighted_source": obs_client.current_highlighted_source,
+                "layout_mode": "highlight"
+            }), 200
+        else:
+            # No highlighted source, assume grid layout
+            return jsonify({
+                "success": True,
+                "scene_name": scene_name,
+                "highlighted_source": None,
+                "layout_mode": "grid"
+            }), 200
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# Start the Flask app
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5001, debug=True)

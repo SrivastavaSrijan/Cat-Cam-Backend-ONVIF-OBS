@@ -41,6 +41,7 @@ class OBSWebSocketClient:
 
         # You might also have these if used below
         self.scene_item_ids = {}  # example from your code
+        self.current_highlighted_source = None  # Track currently highlighted source
 
     # ------------------------------------------------------
     #               WebSocket Event Callbacks
@@ -350,6 +351,9 @@ class OBSWebSocketClient:
         :param active_source: Optional name of a "detected" source to highlight.
         """
         try:
+            # Track the currently highlighted source
+            self.current_highlighted_source = active_source
+            
             # Retrieve all sources from the given scene
             sources = list(self.scene_item_ids.items())  # Convert to list of tuples
             if not sources:
@@ -476,6 +480,6 @@ class OBSWebSocketClient:
             except Exception as e:
                 logging.error(f"Failed to toggle visibility for Mosaic: {e}")
 
-            # Wait for 2.5 mins before toggling again
-            time.sleep(60 * 2.5)
+            # Wait for 30 mins before toggling again
+            time.sleep(60 * 10)
 
