@@ -1,5 +1,6 @@
 import logging
 import time
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from onvif.exceptions import ONVIFError
@@ -461,6 +462,95 @@ def get_current_highlighted_source():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+
+# =========================
+# Route: MJPEG Stream
+# =========================
+import cv2
+from flask import Response
+
+@app.route("/mjpeg")
+def mjpeg_stream():
+    def generate():
+        # Read OBS Virtual Camera device index from environment variable
+        VIDEO_DEVICE_INDEX = int(os.getenv("VIDEO_DEVICE_INDEX", "1"))
+        cap = cv2.VideoCapture(VIDEO_DEVICE_INDEX)
+        if not cap.isOpened():
+            raise RuntimeError("Could not open video source")
+
+        while True:
+            success, frame = cap.read()
+            if not success:
+                continue
+            _, jpeg = cv2.imencode(".jpg", frame)
+            frame_bytes = jpeg.tobytes()
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" + frame_bytes + b"\r\n")
+
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# =========================
+# Route: Start Fullscreen Projector
+# =========================
+@app.route("/obs/projector/start", methods=["POST"])
+def start_projector():
+    data = request.json or {}
+    scene_name = data.get("scene_name", "Mosaic")
+    monitor_index = data.get("monitor_index", 0)
+
+    try:
+        result = obs_client.start_fullscreen_projector(scene_name, monitor_index)
+        return jsonify(result), 200 if "success" in result else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Route: Close Projector
+# =========================
+@app.route("/obs/projector/close", methods=["POST"])
+def close_projector():
+    data = request.json or {}
+    projector_type = data.get("projector_type", "source")
+
+    try:
+        result = obs_client.close_projector(projector_type)
+        return jsonify(result), 200 if "success" in result else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Route: Start Virtual Camera
+# =========================
+@app.route("/obs/virtual_camera/start", methods=["POST"])
+def start_virtual_camera():
+    try:
+        result = obs_client.start_virtual_camera()
+        return jsonify(result), 200 if "success" in result else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Route: Stop Virtual Camera
+# =========================
+@app.route("/obs/virtual_camera/stop", methods=["POST"])
+def stop_virtual_camera():
+    try:
+        result = obs_client.stop_virtual_camera()
+        return jsonify(result), 200 if "success" in result else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# =========================
+# Route: Get Virtual Camera Status
+# =========================
+@app.route("/obs/virtual_camera/status", methods=["GET"])
+def get_virtual_camera_status():
+    try:
+        result = obs_client.get_virtual_camera_status()
+        return jsonify(result), 200 if "success" in result else 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # Start the Flask app
 if __name__ == "__main__":

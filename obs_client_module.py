@@ -242,7 +242,7 @@ class OBSWebSocketClient:
                 items = response["d"]["responseData"].get("sceneItems", [])
                 self.scene_item_ids.clear()
                 # Remove sourceName "Background"
-                items = [item for item in items if item["sourceName"] != "Background"]
+                items = [item for item in items if item["sourceName"] != "Background" and item["sourceName"] != "Please wait!"]
                 for item in items:
                     self.scene_item_ids[item["sourceName"]] = item["sceneItemId"]
                 logging.info(f"Retrieved scene sources: {self.scene_item_ids}")
@@ -482,4 +482,143 @@ class OBSWebSocketClient:
 
             # Wait for 30 mins before toggling again
             time.sleep(60 * 10)
+
+    def start_fullscreen_projector(self, scene_name, monitor_index=0):
+        """
+        Start a fullscreen projector for a specific scene.
+        :param scene_name: Name of the scene to project
+        :param monitor_index: Monitor index (0 for primary, 1 for secondary, etc.)
+        """
+        if not self.connected:
+            logging.warning("Not connected to OBS WebSocket.")
+            return {"error": "Not connected to OBS"}
+
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": "OpenSourceProjector",
+                "requestId": f"projector_{int(time.time())}",
+                "requestData": {
+                    "sourceName": scene_name,
+                    "monitorIndex": monitor_index,
+                    "projectorGeometry": None  # Fullscreen
+                },
+            },
+        }
+
+        try:
+            with self._lock:
+                self.ws.send(json.dumps(payload))
+            logging.info(f"Started fullscreen projector for scene: {scene_name}")
+            return {"success": f"Fullscreen projector started for {scene_name}"}
+        except Exception as e:
+            logging.error(f"Failed to start projector: {e}")
+            return {"error": str(e)}
+
+    def close_projector(self, projector_type="source"):
+        """
+        Close all projectors of specified type.
+        :param projector_type: "source", "scene", "multiview", or "all"
+        """
+        if not self.connected:
+            logging.warning("Not connected to OBS WebSocket.")
+            return {"error": "Not connected to OBS"}
+
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": "CloseProjector",
+                "requestId": f"close_projector_{int(time.time())}",
+                "requestData": {
+                    "projectorType": projector_type
+                },
+            },
+        }
+
+        try:
+            with self._lock:
+                self.ws.send(json.dumps(payload))
+            logging.info(f"Closed {projector_type} projectors")
+            return {"success": f"Closed {projector_type} projectors"}
+        except Exception as e:
+            logging.error(f"Failed to close projector: {e}")
+            return {"error": str(e)}
+
+    def start_virtual_camera(self):
+        """
+        Start the OBS virtual camera.
+        """
+        if not self.connected:
+            logging.warning("Not connected to OBS WebSocket.")
+            return {"error": "Not connected to OBS"}
+
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": "StartVirtualCam",
+                "requestId": f"start_vcam_{int(time.time())}",
+                "requestData": {},
+            },
+        }
+
+        try:
+            with self._lock:
+                self.ws.send(json.dumps(payload))
+            logging.info("Started virtual camera")
+            return {"success": "Virtual camera started"}
+        except Exception as e:
+            logging.error(f"Failed to start virtual camera: {e}")
+            return {"error": str(e)}
+
+    def stop_virtual_camera(self):
+        """
+        Stop the OBS virtual camera.
+        """
+        if not self.connected:
+            logging.warning("Not connected to OBS WebSocket.")
+            return {"error": "Not connected to OBS"}
+
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": "StopVirtualCam",
+                "requestId": f"stop_vcam_{int(time.time())}",
+                "requestData": {},
+            },
+        }
+
+        try:
+            with self._lock:
+                self.ws.send(json.dumps(payload))
+            logging.info("Stopped virtual camera")
+            return {"success": "Virtual camera stopped"}
+        except Exception as e:
+            logging.error(f"Failed to stop virtual camera: {e}")
+            return {"error": str(e)}
+
+    def get_virtual_camera_status(self):
+        """
+        Get the status of the virtual camera.
+        """
+        if not self.connected:
+            logging.warning("Not connected to OBS WebSocket.")
+            return {"error": "Not connected to OBS"}
+
+        payload = {
+            "op": 6,
+            "d": {
+                "requestType": "GetVirtualCamStatus",
+                "requestId": f"vcam_status_{int(time.time())}",
+                "requestData": {},
+            },
+        }
+
+        try:
+            with self._lock:
+                self.ws.send(json.dumps(payload))
+            logging.info("Requested virtual camera status")
+            return {"success": "Virtual camera status requested"}
+        except Exception as e:
+            logging.error(f"Failed to get virtual camera status: {e}")
+            return {"error": str(e)}
 
