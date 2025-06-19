@@ -10,6 +10,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libopencv-dev \
+    curl \
+    lsof \
+    v4l-utils \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install dependencies
@@ -19,12 +22,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application files
 COPY . .
 
-# Expose the application port
-EXPOSE 5000
+# Copy entrypoint script with proper permissions
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+# Expose the application ports
+EXPOSE 5000 
 
 # Add healthcheck
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/health || exit 1
 
-# Start the application
-CMD ["gunicorn", "--workers=2", "--worker-class=gthread", "--threads=4", "app:app", "--bind=0.0.0.0:5000"]
+# Use the entrypoint script
+ENTRYPOINT ["/app/entrypoint.sh"]
