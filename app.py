@@ -596,8 +596,7 @@ def start_mjpeg_stream():
             mjpeg_process = type('obj', (object,), {'pid': status.get("pid"), 'poll': lambda: None if status.get("running") else 0})()  # Mock process object
             return jsonify({
                 "success": "MJPEG streamer started", 
-                "port": 8080, 
-                "url": f"http://{external_domain}:8080",
+                "url": f"https://{external_domain}/stream",
                 "pid": status.get("pid")
             }), 200
         else:
@@ -690,8 +689,7 @@ def mjpeg_stream_status():
     if process_running:
         return jsonify({
             "running": True, 
-            "port": 8080,
-            "url": f"http://{external_domain}:8080",
+            "url": f"https://{external_domain}/stream",
             "pid": status.get("pid"),
             "managed_process": True
         }), 200
@@ -699,8 +697,7 @@ def mjpeg_stream_status():
         # Port is in use but not by our tracked process
         return jsonify({
             "running": True,
-            "port": 8080, 
-            "url": f"http://{external_domain}:8080",
+            "url": f"https://{external_domain}/stream",
             "pid": None,
             "managed_process": False,
             "note": "MJPEG stream detected but not managed by this instance"
