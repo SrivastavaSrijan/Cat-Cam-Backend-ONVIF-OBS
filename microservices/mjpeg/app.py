@@ -1,24 +1,9 @@
 #!/usr/bin/env python3
-"""
-S        # FFmpeg command for OBS Virtual Camera - 60fps, better quality
-        cmd = [
-            'ffmpeg',
-            '-f', 'avfoundation',
-            '-framerate', '60',  # Keep 60fps as required
-            '-pixel_format', 'nv12',  # Better pixel format for OBS Virtual Camera
-            '-i', '0',  # Device 0 ONLY
-            '-vf', 'scale=640:360:flags=lanczos',  # Better scaling, no fps filter
-            '-f', 'mjpeg',
-            '-q:v', '3',  # Much better quality
-            '-threads', '4',  # Multi-threading for better performance
-            'pipe:1'
-        ]MJPEG Streaming Service
-Uses FFmpeg directly for camera access - no OpenCV bullshit
-"""
 
 import subprocess
 import threading
 import time
+import os
 from flask import Flask, Response, jsonify
 from flask_cors import CORS
 import queue
@@ -34,6 +19,13 @@ frame_buffer = queue.Queue(maxsize=10)  # Buffer for frames
 frame_reader_thread = None
 latest_frame = None
 frame_lock = threading.Lock()
+
+def get_base_url():
+    """Get base URL from environment variable or fallback to localhost"""
+    external_domain = os.getenv('EXTERNAL_DOMAIN')
+    if external_domain:
+        return f"https://{external_domain}"
+    return "http://localhost:8080"
 
 def read_frames_from_ffmpeg():
     """Read frames from FFmpeg and buffer them for multiple clients"""
@@ -91,12 +83,12 @@ def start_ffmpeg_stream():
         cmd = [
             'ffmpeg',
             '-f', 'avfoundation',
-            '-framerate', '60',  # Lower framerate for OBS stability
-            '-pixel_format', 'nv12',  # Better pixel format for OBS Virtual Camera
+            '-framerate', '60',  # Keep 60fps as required
+            '-pixel_format', 'nv12',  # Keep nv12 as required
             '-i', '0',  # Device 0 ONLY
-            '-vf', 'scale=1280:720:flags=lanczos,fps=30',  # Better scaling, consistent fps
+            '-vf', 'scale=960:540:flags=fast_bilinear',  # 16:9 aspect ratio, fast scaling for low latency
             '-f', 'mjpeg',
-            '-q:v', '6',  # Balanced quality/performance
+            '-q:v', '4',  # Higher quality for mobile (lower number = better quality)
             '-threads', '4',  # Multi-threading for better performance
             'pipe:1'
         ]
@@ -232,7 +224,7 @@ def start():
                 "streaming": streaming_active,
                 "camera_type": "real",
                 "clients": 0,
-                "stream_url": f"http://localhost:8080/stream",
+                "stream_url": f"{get_base_url()}/stream",
                 "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None
             }
             return {
@@ -264,7 +256,7 @@ def status():
         "streaming": streaming_active,  # backward compatibility
         "camera_type": "real",
         "clients": 0,  # FFmpeg doesn't track clients
-        "stream_url": f"http://localhost:8080/stream" if streaming_active else None,
+        "stream_url": f"{get_base_url()}/stream" if streaming_active else None,
         "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None,
         "error": None
     }
