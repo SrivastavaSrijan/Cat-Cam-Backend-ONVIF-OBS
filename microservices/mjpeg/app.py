@@ -227,24 +227,25 @@ def start():
     try:
         start_ffmpeg_stream()
         if streaming_active:
-            return {
-                "success": "MJPEG stream started",
-                "status": "started", 
+            response_data = {
+                "active": True,
                 "streaming": streaming_active,
                 "camera_type": "real",
-                "stream_url": f"http://localhost:8080/stream"
+                "clients": 0,
+                "stream_url": f"http://localhost:8080/stream",
+                "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None
+            }
+            return {
+                "success": "MJPEG stream started",
+                "data": response_data
             }, 200
         else:
             return {
-                "error": "Failed to start stream - streaming not active after start attempt",
-                "status": "failed",
-                "streaming": streaming_active
+                "error": "Failed to start stream - streaming not active after start attempt"
             }, 500
     except Exception as e:
         return {
-            "error": f"Failed to start stream: {str(e)}",
-            "status": "failed",
-            "streaming": streaming_active
+            "error": f"Failed to start stream: {str(e)}"
         }, 500
 
 @app.route('/stop', methods=['POST'])
@@ -252,15 +253,13 @@ def stop():
     """Stop streaming"""
     stop_ffmpeg_stream()
     return {
-        "success": "MJPEG stream stopped",
-        "status": "stopped", 
-        "streaming": streaming_active
+        "success": "MJPEG stream stopped"
     }, 200
 
 @app.route('/status')
 def status():
     """Get streaming status"""
-    return {
+    status_data = {
         "active": streaming_active,
         "streaming": streaming_active,  # backward compatibility
         "camera_type": "real",
@@ -268,15 +267,21 @@ def status():
         "stream_url": f"http://localhost:8080/stream" if streaming_active else None,
         "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None,
         "error": None
+    }
+    return {
+        "data": status_data
     }, 200
 
 @app.route('/health')
 def health():
     """Health check endpoint"""
-    return {
+    health_data = {
         "status": "healthy",
         "service": "mjpeg-streaming", 
         "timestamp": time.time()
+    }
+    return {
+        "data": health_data
     }, 200
 
 if __name__ == '__main__':

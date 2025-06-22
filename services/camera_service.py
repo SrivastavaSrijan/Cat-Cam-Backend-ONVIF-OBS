@@ -4,6 +4,7 @@ Camera service wrapper for managing ONVIF camera operations.
 import logging
 from threading import Lock
 from lib.camera.onvif_manager import ONVIFCameraManager, ONVIFCameraInstance
+from utils.response import success_response, error_response, data_response
 
 
 class CameraService:
@@ -45,19 +46,23 @@ class CameraService:
         for nickname, camera in self.camera_manager.cameras.items():
             if camera:
                 safe_status = camera.get_status_safe()
-                cameras.append({
+                camera_info = {
                     "nickname": nickname,
                     "host": safe_status.get("host", "unknown"),
                     "port": getattr(camera, '_port', 554),  # Default ONVIF port
                     "status": "online" if safe_status.get("online", False) else "offline",
-                    "error": safe_status.get("error") if not safe_status.get("online", False) else None
-                })
+                    "online": safe_status.get("online", False)
+                }
+                if not safe_status.get("online", False):
+                    camera_info["error"] = safe_status.get("error")
+                cameras.append(camera_info)
             else:
                 cameras.append({
                     "nickname": nickname,
                     "host": "unknown",
                     "port": 554,
                     "status": "offline",
+                    "online": False,
                     "error": "Camera not initialized"
                 })
         return cameras

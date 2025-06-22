@@ -4,6 +4,7 @@ Detection service for managing motion detection processes.
 import subprocess
 import os
 from threading import Lock
+from utils.response import success_response, error_response, data_response
 
 
 class DetectionService:
@@ -18,14 +19,14 @@ class DetectionService:
         """Start the detection process"""
         with self.lock:
             if self.process and self.process.poll() is None:
-                return {"error": "Detection script is already running"}
+                return error_response("Detection script is already running")
 
             # Clear the log file on start
             try:
                 with open(self.log_file_path, "w") as log_file:
                     log_file.truncate(0)
             except Exception as e:
-                return {"error": f"Failed to clear log file: {str(e)}"}
+                return error_response(f"Failed to clear log file: {str(e)}")
 
             try:
                 with open(self.log_file_path, "a") as log_file:
@@ -34,15 +35,15 @@ class DetectionService:
                         stdout=log_file,
                         stderr=log_file,
                     )
-                return {"success": "Detection script started"}
+                return success_response(message="Detection script started")
             except Exception as e:
-                return {"error": f"Failed to start script: {str(e)}"}
+                return error_response(f"Failed to start script: {str(e)}")
     
     def stop_detection(self):
         """Stop the detection process"""
         with self.lock:
             if not self.process or self.process.poll() is not None:
-                return {"error": "No detection script is running"}
+                return error_response("No detection script is running")
 
             try:
                 self.process.terminate()
@@ -52,27 +53,28 @@ class DetectionService:
                 with open(self.log_file_path, "w") as log_file:
                     log_file.truncate(0)
 
-                return {"success": "Detection script stopped"}
+                return success_response(message="Detection script stopped")
             except Exception as e:
-                return {"error": f"Failed to stop script: {str(e)}"}
+                return error_response(f"Failed to stop script: {str(e)}")
     
     def fetch_logs(self):
         """Fetch the logs from the detection script"""
         try:
             with open(self.log_file_path, "r") as log_file:
-                logs = log_file.read()
-            return {"logs": logs}
+                logs = log_file.readlines()
+            return data_response({"logs": logs})
         except FileNotFoundError:
-            return {"logs": "Log file not found"}
+            return data_response({"logs": []})
         except Exception as e:
-            return {"error": str(e)}
+            return error_response(str(e))
     
     def get_status(self):
         """Get the status of the detection process"""
         with self.lock:
             if self.process and self.process.poll() is None:
-                return {"running": True, "exit_code": None}
+                detection_status = {"running": True, "exit_code": None}
             elif self.process:
-                return {"running": False, "exit_code": self.process.poll()}
+                detection_status = {"running": False, "exit_code": self.process.poll()}
             else:
-                return {"running": False, "exit_code": None}
+                detection_status = {"running": False, "exit_code": None}
+            return data_response(detection_status)
