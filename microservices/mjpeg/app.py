@@ -4,7 +4,7 @@ import subprocess
 import threading
 import time
 import os
-from flask import Flask, Response, jsonify
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 import queue
 import copy
@@ -21,10 +21,24 @@ latest_frame = None
 frame_lock = threading.Lock()
 
 def get_base_url():
-    """Get base URL from environment variable or fallback to localhost"""
+    """Get base URL from the current request - localhost gets :8080, others use their own domain"""
+    if request:
+        host = request.host
+        scheme = request.scheme
+        
+        # If it's localhost, add port 8080
+        if 'localhost' in host or '127.0.0.1' in host:
+            # Remove any existing port and add 8080
+            host_without_port = host.split(':')[0]
+            return f"{scheme}://{host_without_port}:8080"
+        else:
+            # Use the host as-is (reverse proxy handles the domain)
+            return f"{scheme}://{host}/stream"
+    
+    # Fallback if no request context
     external_domain = os.getenv('EXTERNAL_DOMAIN')
     if external_domain:
-        return f"https://{external_domain}"
+        return f"https://{external_domain}/stream"
     return "http://localhost:8080"
 
 def read_frames_from_ffmpeg():
