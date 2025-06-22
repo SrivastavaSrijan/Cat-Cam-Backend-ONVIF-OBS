@@ -43,12 +43,21 @@ class CameraService:
         """Get list of all cameras with their status"""
         cameras = []
         for nickname, camera in self.camera_manager.cameras.items():
-            status = camera.get_status_safe()
-            cameras.append({
-                "nickname": nickname,
-                "host": status.get("host"),
-                "online": status.get("online", False),
-                "ptz_available": status.get("ptz_available", False),
-                "presets_available": status.get("presets_available", False)
-            })
+            if camera:
+                safe_status = camera.get_status_safe()
+                cameras.append({
+                    "nickname": nickname,
+                    "host": safe_status.get("host", "unknown"),
+                    "port": getattr(camera, '_port', 554),  # Default ONVIF port
+                    "status": "online" if safe_status.get("online", False) else "offline",
+                    "error": safe_status.get("error") if not safe_status.get("online", False) else None
+                })
+            else:
+                cameras.append({
+                    "nickname": nickname,
+                    "host": "unknown",
+                    "port": 554,
+                    "status": "offline",
+                    "error": "Camera not initialized"
+                })
         return cameras

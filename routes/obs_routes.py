@@ -69,7 +69,7 @@ def init_obs_routes(obs_service):
         """Get the currently highlighted source in the Mosaic scene"""
         try:
             scene_name = request.args.get("scene_name", "Mosaic")
-            result = obs_service.get_current_transformation()
+            result = obs_service.get_current_transformation(scene_name)
             return jsonify(result), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500

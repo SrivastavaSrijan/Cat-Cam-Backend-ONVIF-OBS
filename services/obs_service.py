@@ -25,15 +25,16 @@ class OBSService:
     def get_scenes(self):
         """Get all OBS scenes"""
         try:
+            from config.shared_config import STREAMS
             self.obs_client.retrieve_scene_sources("Mosaic")
-            return {"success": "Scene sources retrieved"}
+            return {"scenes": STREAMS}
         except Exception as e:
             return {"error": str(e)}
     
     def get_current_scene(self):
         """Get current OBS scene"""
         try:
-            # Note: This method may need to be implemented in OBSWebSocketClient
+            # TODO: Implement get_current_scene in OBSWebSocketClient if needed
             return {"current_scene": "Not implemented"}
         except Exception as e:
             return {"error": str(e)}
@@ -60,13 +61,26 @@ class OBSService:
         except Exception as e:
             return {"error": str(e)}
     
-    def get_current_transformation(self):
+    def get_current_transformation(self, scene_name="Mosaic"):
         """Get current highlighted source"""
         try:
+            print(self.obs_client.current_highlighted_source)
+            # Check if OBS client has a current highlighted source stored
             if hasattr(self.obs_client, 'current_highlighted_source') and self.obs_client.current_highlighted_source:
-                return {"highlighted_source": self.obs_client.current_highlighted_source}
+                return {
+                    "success": True,
+                    "scene_name": scene_name,
+                    "highlighted_source": self.obs_client.current_highlighted_source,
+                    "layout_mode": "highlight"
+                }
             else:
-                return {"highlighted_source": None}
+                # No highlighted source, assume grid layout
+                return {
+                    "success": True,
+                    "scene_name": scene_name,
+                    "highlighted_source": None,
+                    "layout_mode": "grid"
+                }
         except Exception as e:
             return {"error": str(e)}
     

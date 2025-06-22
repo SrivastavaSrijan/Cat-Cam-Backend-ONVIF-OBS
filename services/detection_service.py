@@ -63,7 +63,7 @@ class DetectionService:
                 logs = log_file.read()
             return {"logs": logs}
         except FileNotFoundError:
-            return {"logs": "No logs available"}
+            return {"logs": "Log file not found"}
         except Exception as e:
             return {"error": str(e)}
     

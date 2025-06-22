@@ -36,6 +36,8 @@ def init_detection_routes(detection_service):
         """Fetch the logs from the detection script"""
         try:
             result = detection_service.fetch_logs()
+            if "logs" in result and result["logs"] == "Log file not found":
+                return jsonify(result), 404
             return jsonify(result), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
