@@ -1,14 +1,36 @@
 #!/usr/bin/env python3
+"""
+FFmpeg MJPEG streaming service with integrated motion detection.
+Streams video from OBS Virtual Camera with optional cat detection overlay.
+"""
 
+# Standard library imports
+import json
+import os
+import queue
+import re
+import signal
 import subprocess
 import threading
 import time
-import os
-import signal
+
+# Third-party imports
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
-import queue
-import re
+
+# Import our detection module
+try:
+    from lib.mjpeg_detection.motion_processor import (
+        process_frame_for_detection, 
+        init_detection, 
+        toggle_detection, 
+        get_detection_status,
+        refresh_film_strip
+    )
+    DETECTION_AVAILABLE = True
+except ImportError as e:
+    print(f"Detection module not available: {e}")
+    DETECTION_AVAILABLE = False
 
 app = Flask(__name__)
 CORS(app)
@@ -22,6 +44,11 @@ stderr_reader_thread = None
 latest_frame = None
 frame_lock = threading.Lock()
 restart_lock = threading.Lock()
+
+# Initialize detection on startup (auto-enable if available)
+if DETECTION_AVAILABLE:
+    init_detection()
+    print("Motion detection auto-enabled and ready")
 
 def get_obs_camera_index():
     """Find OBS Virtual Camera by name instead of guessing index"""
@@ -264,8 +291,14 @@ def read_frames_from_ffmpeg():
                 frame_data = frame_data[end_pos + 2:]
                 
                 if len(jpeg_frame) > 500:
+                    # NEW: Process frame for detection (with fallback to original)
+                    if DETECTION_AVAILABLE:
+                        processed_frame = process_frame_for_detection(jpeg_frame)
+                    else:
+                        processed_frame = jpeg_frame
+                    
                     with frame_lock:
-                        latest_frame = jpeg_frame
+                        latest_frame = processed_frame
                 
                 if len(frame_data) > 50000:
                     frame_data = frame_data[-25000:]
@@ -500,6 +533,79 @@ def health():
         "data": health_data
     }, 200
 
+# NEW: Detection control routes
+@app.route('/detection/toggle', methods=['POST'])
+def toggle_detection_route():
+    """Toggle motion detection on/off"""
+    if not DETECTION_AVAILABLE:
+        return {"error": "Detection not available"}, 503
+    
+    try:
+        enabled = request.json.get('enabled', True)
+        result = toggle_detection(enabled)
+        return {"success": f"Detection {'enabled' if result else 'disabled'}"}, 200
+    except Exception as e:
+        return {"error": f"Failed to toggle detection: {e}"}, 500
+
+@app.route('/detection/status')
+def detection_status():
+    """Get detection status"""
+    if not DETECTION_AVAILABLE:
+        return {"data": {"available": False, "error": "Detection module not loaded"}}, 200
+    
+    try:
+        status = get_detection_status()
+        status["available"] = True
+        return {"data": status}, 200
+    except Exception as e:
+        return {"error": f"Failed to get status: {e}"}, 500
+
+@app.route('/detection/logs')
+def detection_logs():
+    """Get recent detection logs"""
+    if not DETECTION_AVAILABLE:
+        return {"error": "Detection not available"}, 503
+    
+    try:
+        log_file = "motion_logs/events.jsonl"
+        if not os.path.exists(log_file):
+            return {"data": {"events": [], "count": 0}}, 200
+        
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+            recent_lines = lines[-50:] if len(lines) > 50 else lines
+            
+        events = []
+        for line in recent_lines:
+            try:
+                events.append(json.loads(line.strip()))  # Use json.loads instead of eval
+            except (json.JSONDecodeError, ValueError):
+                continue
+        
+        return {"data": {"events": events, "count": len(events)}}, 200
+    except Exception as e:
+        return {"error": f"Failed to get logs: {e}"}, 500
+
+@app.route('/detection/refresh-strip', methods=['POST'])
+def refresh_detection_strip():
+    """Manually refresh the detection strip"""
+    if not DETECTION_AVAILABLE:
+        return {"error": "Detection not available"}, 503
+    
+    try:
+        result = refresh_film_strip()
+        if result["success"]:
+            return {"success": result["message"]}, 200
+        else:
+            return {"error": result["error"]}, 500
+    except Exception as e:
+        return {"error": f"Failed to refresh detection strip: {e}"}, 500
+
 if __name__ == '__main__':
-    print("Starting simple FFmpeg MJPEG service on port 8080")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    print("Starting FFmpeg MJPEG service with detection on port 8081")
+    if DETECTION_AVAILABLE:
+        print("Motion detection auto-enabled - cat detection and smart cropping active")
+        print("Cropped detections will be saved to: motion_logs/crops/")
+    else:
+        print("Detection module not available - streaming only")
+    app.run(host='0.0.0.0', port=8081, debug=False)

@@ -237,8 +237,8 @@ class OBSWebSocketClient:
             if request_type == "GetSceneItemList":
                 items = response["d"]["responseData"].get("sceneItems", [])
                 self.scene_item_ids.clear()
-                # Remove sourceName "Background"
-                items = [item for item in items if item["sourceName"] != "Background" and item["sourceName"] != "Please wait!"]
+                # Remove sources we don't want to transform: Background, Please wait, and Detections
+                items = [item for item in items if item["sourceName"] not in ["Background", "Please wait!", "Detections"]]
                 for item in items:
                     self.scene_item_ids[item["sourceName"]] = item["sceneItemId"]
                 logging.info(f"Retrieved scene sources: {self.scene_item_ids}")
@@ -594,23 +594,24 @@ class OBSWebSocketClient:
 
         layout_instructions = {}
 
+
         if active_source and active_source in self.scene_item_ids:
-            # Active-source layout
+            # Active-source layout with space for detection strip
             active_item_id = self.scene_item_ids.get(active_source)
-            active_width = int(CANVAS_WIDTH * 0.75)  # 960
-            active_height = int(CANVAS_HEIGHT * 0.75)  # 540
+            active_width = int(CANVAS_WIDTH * 0.75)  # 960px
+            active_height = int(CANVAS_HEIGHT * 0.75)  # ~690px (75% of available height)
 
             layout_instructions[active_source] = {
                 "sceneItemId": active_item_id,
                 "positionX": 0,
-                "positionY": (CANVAS_HEIGHT - active_height) // 4,
+                "positionY":  0, # Top-left corner
                 "boundsType": "OBS_BOUNDS_SCALE_INNER",
                 "boundsWidth": active_width,
                 "boundsHeight": active_height,
             }
             
             others = [src for src, _ in sources if src != active_source]
-            side_width = CANVAS_WIDTH - active_width  # ~320
+            side_width = CANVAS_WIDTH - active_width  # ~320px
             side_height_each = CANVAS_HEIGHT // len(others) if others else 0
 
             for idx, src_name in enumerate(others):
@@ -625,9 +626,9 @@ class OBSWebSocketClient:
                         "boundsHeight": side_height_each,
                     }
         else:
-            # Default 2×2 Grid Layout
-            cell_width = CANVAS_WIDTH // 2   # 640
-            cell_height = CANVAS_HEIGHT // 2  # 360
+            # Default 2×2 Grid Layout with space for detection strip
+            cell_width = CANVAS_WIDTH // 2   # 640px
+            cell_height = CANVAS_HEIGHT // 2  # ~405px (half of available height)
 
             for idx, (src_name, scene_item_id) in enumerate(sources):
                 col = idx % 2  # 0 or 1
