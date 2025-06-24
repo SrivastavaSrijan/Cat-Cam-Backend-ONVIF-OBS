@@ -25,7 +25,8 @@ try:
         init_detection, 
         toggle_detection, 
         get_detection_status,
-        refresh_film_strip
+        refresh_film_strip,
+        create_detections_strip
     )
     DETECTION_AVAILABLE = True
 except ImportError as e:
@@ -601,6 +602,31 @@ def refresh_detection_strip():
     except Exception as e:
         return {"error": f"Failed to refresh detection strip: {e}"}, 500
 
+# NEW: Test endpoint for film strip generation
+@app.route('/detection/test-strip', methods=['POST'])
+def test_detection_strip():
+    """Test the film strip generation with current detection images"""
+    if not DETECTION_AVAILABLE:
+        return {"error": "Detection not available"}, 503
+    
+    try:
+        # Create the strip
+        create_detections_strip()
+        
+        # Get current status
+        status = get_detection_status()
+        
+        return {
+            "success": "Film strip generated successfully", 
+            "data": {
+                "strip_file": "motion_logs/detections_strip.png",
+                "film_strip_info": status.get("film_strip", {}),
+                "message": "Check the detection strip PNG image to see the optimized transparent layout"
+            }
+        }, 200
+    except Exception as e:
+        return {"error": f"Failed to generate test strip: {e}"}, 500
+
 if __name__ == '__main__':
     print("Starting FFmpeg MJPEG service with detection on port 8081")
     if DETECTION_AVAILABLE:
@@ -608,4 +634,4 @@ if __name__ == '__main__':
         print("Cropped detections will be saved to: motion_logs/crops/")
     else:
         print("Detection module not available - streaming only")
-    app.run(host='0.0.0.0', port=8081, debug=False)
+    app.run(host='0.0.0.0', port=8080, debug=False)

@@ -40,7 +40,7 @@ latest_frame_for_periodic = None  # Store latest frame for periodic checks
 MOTION_THRESHOLD = 25
 MOTION_LOG_DIR = "motion_logs"
 CROP_SAVE_DIR = "motion_logs/crops"  # Directory for cropped detections
-DETECTION_STRIP_FILE = "motion_logs/detections_strip.jpg"  # OBS image source file
+DETECTION_STRIP_FILE = "motion_logs/detections_strip.png"  # OBS image source file (PNG for transparency)
 YOLO_MODEL_PATH = "/Users/srijansrivastava/Documents/Personal/ssvcam/backend/data/yolov8l.pt"  # Use existing model in data folder
 YOLO_MODEL_FALLBACK = "yolov8n.pt"  # Fallback to nano model (downloads automatically)
 CAT_CLASS_ID = 15  # COCO dataset class ID for cats
@@ -51,8 +51,9 @@ JPEG_QUALITY = 85
 STRIP_WIDTH = 1920  # Target width for the film strip (OBS canvas width)
 STRIP_HEIGHT = 270  # Height of the detection strip (updated to match available space)
 STRIP_MAX_IMAGES = 6  # Number of images in 3-minute window (30s intervals)
-STRIP_MARGIN = 10  # Margin between images
-STRIP_TIMESTAMP_HEIGHT = 30  # Height reserved for timestamp text (increased for better visibility)
+STRIP_MARGIN = 15  # Margin between images (increased for better spacing)
+STRIP_TIMESTAMP_HEIGHT = 35  # Height reserved for timestamp text with background
+STRIP_LEFT_MARGIN = 20  # Left margin to start images away from edge
 
 def start_detection_thread():
     """Start the async detection processing thread"""
@@ -300,39 +301,56 @@ def reset_save_interval():
     pass
 
 def create_detections_strip():
-    """Create a rolling film strip of detection images for OBS with timestamps"""
+    """Create a rolling film strip of detection images for OBS with transparency and optimized layout"""
     try:
         # Get film strip files (chronological order, oldest first for left-to-right display)
         crop_pattern = os.path.join(CROP_SAVE_DIR, "filmstrip_*.jpg")
         crop_files = sorted(glob.glob(crop_pattern), key=os.path.getmtime)
         
         if not crop_files:
-            # Create empty strip if no detections
-            empty_strip = np.zeros((STRIP_HEIGHT, STRIP_WIDTH, 3), dtype=np.uint8)
-            cv2.putText(empty_strip, "No detections yet - waiting for motion...", 
-                       (50, STRIP_HEIGHT // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (128, 128, 128), 2)
-            cv2.imwrite(DETECTION_STRIP_FILE, empty_strip, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            # Create transparent strip with minimal "waiting" message
+            strip = np.zeros((STRIP_HEIGHT, STRIP_WIDTH, 4), dtype=np.uint8)  # RGBA for transparency
+            
+            # Add a subtle waiting message with background
+            message = "Waiting for detections..."
+            text_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            text_x = STRIP_LEFT_MARGIN
+            text_y = STRIP_HEIGHT // 2 + 10
+            
+            # Add semi-transparent background for text
+            cv2.rectangle(strip, (text_x - 5, text_y - 25), (text_x + text_size[0] + 10, text_y + 10), 
+                         (0, 0, 0, 180), -1)  # Semi-transparent black
+            
+            # Add white text
+            strip_bgr = cv2.cvtColor(strip, cv2.COLOR_RGBA2BGR)
+            cv2.putText(strip_bgr, message, (text_x, text_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Convert back to RGBA and set alpha
+            strip = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2RGBA)
+            strip[:, :, 3] = np.where(np.any(strip[:, :, :3] != 0, axis=2), 255, 0)  # Transparent where black
+            
+            cv2.imwrite(DETECTION_STRIP_FILE, strip)
             return
         
-        # Calculate cell dimensions to fit STRIP_WIDTH
+        # Calculate optimal image dimensions for left-aligned layout
         num_images = min(len(crop_files), STRIP_MAX_IMAGES)
-        total_margin = STRIP_MARGIN * (num_images + 1)  # Margins on sides and between images
-        available_width = STRIP_WIDTH - total_margin
-        cell_width = available_width // num_images if num_images > 0 else STRIP_WIDTH
         
-        # Ensure minimum cell width
-        if cell_width < 100:
-            cell_width = 100
-            num_images = min(num_images, (STRIP_WIDTH - total_margin) // cell_width)
+        # Use available width more efficiently - calculate based on actual content
+        available_width = STRIP_WIDTH - STRIP_LEFT_MARGIN - (STRIP_MARGIN * (num_images - 1))
+        ideal_cell_width = available_width // num_images if num_images > 0 else 200
         
-        # Create the strip background
-        strip = np.zeros((STRIP_HEIGHT, STRIP_WIDTH, 3), dtype=np.uint8)
+        # Ensure reasonable minimum and maximum cell widths
+        cell_width = max(150, min(ideal_cell_width, 300))
+        
+        # Create transparent strip (RGBA)
+        strip = np.zeros((STRIP_HEIGHT, STRIP_WIDTH, 4), dtype=np.uint8)
         
         # Take the most recent images (up to STRIP_MAX_IMAGES)
         recent_crops = crop_files[-num_images:] if num_images > 0 else []
         
         # Process and place images left to right (oldest to newest)
-        current_x = STRIP_MARGIN
+        current_x = STRIP_LEFT_MARGIN
         
         for i, crop_file in enumerate(recent_crops):
             try:
@@ -342,17 +360,16 @@ def create_detections_strip():
                 
                 # Get image timestamp from filename
                 filename = os.path.basename(crop_file)
-                # Extract timestamp from filename: filmstrip_YYYYMMDD_HHMMSS.jpg
                 timestamp_str = filename.replace("filmstrip_", "").replace(".jpg", "")
                 try:
                     timestamp_dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
-                    # Format as "DD-MM HH:mm AM/PM"
-                    time_text = timestamp_dt.strftime("%d-%m %I:%M %p")
+                    # Shorter format: "HH:mm AM/PM"
+                    time_text = timestamp_dt.strftime("%I:%M %p")
                 except ValueError:
-                    time_text = "Unknown"
+                    time_text = "??:??"
                 
                 # Calculate image area (reserve space for timestamp)
-                img_height = STRIP_HEIGHT - STRIP_TIMESTAMP_HEIGHT - 5 # 5px padding
+                img_height = STRIP_HEIGHT - STRIP_TIMESTAMP_HEIGHT - 10  # 10px padding
                 
                 # Resize image to fit cell while maintaining aspect ratio
                 h, w = img.shape[:2]
@@ -368,43 +385,79 @@ def create_detections_strip():
                 if new_width > 0 and new_height > 0:
                     resized = cv2.resize(img, (new_width, new_height))
                     
-                    # Center the image in the cell
-                    img_x = current_x + (cell_width - new_width) // 2
-                    img_y = STRIP_TIMESTAMP_HEIGHT + 5 + (img_height - new_height) // 2
+                    # Position image in the cell (top-aligned for better layout)
+                    img_x = current_x
+                    img_y = STRIP_TIMESTAMP_HEIGHT + 5  # Start below timestamp area
                     
                     # Place the image in the strip
                     end_x = min(img_x + new_width, STRIP_WIDTH)
                     end_y = min(img_y + new_height, STRIP_HEIGHT)
                     
                     if img_x < STRIP_WIDTH and img_y < STRIP_HEIGHT:
-                        strip[img_y:end_y, img_x:end_x] = resized[:end_y-img_y, :end_x-img_x]
+                        # Convert to RGBA and place image
+                        resized_rgba = cv2.cvtColor(resized, cv2.COLOR_BGR2RGBA)
+                        resized_rgba[:, :, 3] = 255  # Fully opaque
                         
-                        # Add timestamp below the image
-                        text_x = current_x + (cell_width - len(time_text) * 8) // 2  # Rough centering
-                        text_x = max(current_x, min(text_x, STRIP_WIDTH - len(time_text) * 8))
+                        strip[img_y:end_y, img_x:end_x] = resized_rgba[:end_y-img_y, :end_x-img_x]
                         
-                        cv2.putText(strip, time_text, (text_x, 20), 
+                        # Add timestamp with background for better readability
+                        text_size = cv2.getTextSize(time_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+                        text_x = img_x + (new_width - text_size[0]) // 2  # Center under image
+                        text_y = 25
+                        
+                        # Add semi-transparent background for timestamp
+                        bg_padding = 3
+                        cv2.rectangle(strip, 
+                                    (text_x - bg_padding, text_y - 18), 
+                                    (text_x + text_size[0] + bg_padding, text_y + 5), 
+                                    (0, 0, 0, 200), -1)  # Semi-transparent black
+                        
+                        # Convert to BGR for text rendering, then back to RGBA
+                        strip_bgr = cv2.cvtColor(strip, cv2.COLOR_RGBA2BGR)
+                        cv2.putText(strip_bgr, time_text, (text_x, text_y), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+                        strip = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2RGBA)
                         
-                        print(f"Added image {i+1}/{num_images}: {time_text}")
+                        # Restore alpha channel (preserve transparency)
+                        strip[:, :, 3] = np.where(np.any(strip[:, :, :3] != 0, axis=2), 255, 0)
+                        
+                        print(f"Added detection {i+1}/{num_images} at {time_text}")
                 
-                current_x += cell_width + STRIP_MARGIN
+                # Move to next position with smart spacing
+                current_x += new_width + STRIP_MARGIN
                 
             except Exception as e:
                 print(f"Error processing film strip image {crop_file}: {e}")
                 continue
         
-        # Add overall strip info
-        info_text = f"Detection Timeline - Last {num_images} detections"
-        cv2.putText(strip, info_text, (STRIP_WIDTH - 400, STRIP_HEIGHT - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        # Add minimal info overlay (bottom right, with background)
+        if num_images > 0:
+            info_text = f"{num_images} recent"
+            text_size = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            info_x = STRIP_WIDTH - text_size[0] - 20
+            info_y = STRIP_HEIGHT - 10
+            
+            # Add background for info text
+            cv2.rectangle(strip, 
+                        (info_x - 5, info_y - 15), 
+                        (info_x + text_size[0] + 5, info_y + 3), 
+                        (0, 0, 0, 150), -1)  # Semi-transparent black
+            
+            # Add info text
+            strip_bgr = cv2.cvtColor(strip, cv2.COLOR_RGBA2BGR)
+            cv2.putText(strip_bgr, info_text, (info_x, info_y), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            strip = cv2.cvtColor(strip_bgr, cv2.COLOR_BGR2RGBA)
+            
+            # Restore alpha channel
+            strip[:, :, 3] = np.where(np.any(strip[:, :, :3] != 0, axis=2), 255, 0)
         
-        # Save strip for OBS to use
-        cv2.imwrite(DETECTION_STRIP_FILE, strip, [cv2.IMWRITE_JPEG_QUALITY, 90])
-        print(f"Updated rolling film strip with {num_images} images")
+        # Save strip for OBS (PNG with transparency)
+        cv2.imwrite(DETECTION_STRIP_FILE, strip)
+        print(f"Updated optimized film strip with {num_images} detections (left-aligned, transparent PNG)")
         
     except Exception as e:
-        print(f"Error creating rolling film strip: {e}")
+        print(f"Error creating optimized film strip: {e}")
 
 def log_detection_event(event_type, detections_count=0):
     """Log detection events to file"""

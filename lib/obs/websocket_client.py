@@ -612,7 +612,7 @@ class OBSWebSocketClient:
             
             others = [src for src, _ in sources if src != active_source]
             side_width = CANVAS_WIDTH - active_width  # ~320px
-            side_height_each = CANVAS_HEIGHT // len(others) if others else 0
+            side_height_each = active_height // len(others) if others else 0
 
             for idx, src_name in enumerate(others):
                 item_id = self.scene_item_ids.get(src_name)
