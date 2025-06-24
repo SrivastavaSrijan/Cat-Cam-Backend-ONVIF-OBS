@@ -69,16 +69,17 @@ class OBSService:
         try:
             print(self.obs_client.current_highlighted_source)
             # Check if OBS client has a current highlighted source stored
-            if hasattr(self.obs_client, 'current_highlighted_source') and self.obs_client.current_highlighted_source:
+            source_name = self.obs_client.get_highlighted_source_name()
+
+            if source_name:
                 transformation_state = {
                     "layout_mode": "highlight",
-                    "highlighted_source": self.obs_client.current_highlighted_source
+                    "highlighted_source": source_name
                 }
             else:
                 # No highlighted source, assume grid layout
                 transformation_state = {
                     "layout_mode": "grid",
-                    "highlighted_source": ""
                 }
             return data_response(transformation_state)
         except Exception as e:

@@ -1,6 +1,7 @@
 """
 PTZ camera control routes.
 """
+from config.config import Config
 from flask import Blueprint, request, jsonify
 from onvif.exceptions import ONVIFError
 from lib.camera.onvif_manager import ONVIFCameraInstance
@@ -187,6 +188,34 @@ def init_ptz_routes(camera_service):
         try:
             cameras = camera_service.get_camera_list()
             return jsonify(data_response({"cameras": cameras})), 200
+        except Exception as e:
+            return jsonify(error_response(str(e))), 500
+
+    @ptz_bp.route("/reinitialize", methods=["POST"])
+    def reinitialize_cameras():
+        """Reinitialize all cameras and return their status"""
+        try:
+            camera_service._initialize_cameras(Config.CAMERA_CONFIGS)
+            cameras = camera_service.get_camera_list()
+            return jsonify(data_response({"cameras": cameras})), 200
+        except Exception as e:
+            return jsonify(error_response(str(e))), 500
+            
+    @ptz_bp.route("/get_highlighted_source", methods=["GET"])
+    def get_highlighted_source():
+        """Get the currently highlighted source in OBS based on transform sizes"""
+        try:
+            # Check if OBS service is available through camera service
+            if not hasattr(camera_service, 'obs_client') or not camera_service.obs_client:
+                return jsonify(error_response("OBS client not available")), 404
+                
+            # Get the highlighted source from OBS
+            result = camera_service.obs_client.get_current_highlighted_source()
+            
+            if "error" in result:
+                return jsonify(error_response(result["error"])), 500
+                
+            return jsonify(data_response(result)), 200
         except Exception as e:
             return jsonify(error_response(str(e))), 500
 
