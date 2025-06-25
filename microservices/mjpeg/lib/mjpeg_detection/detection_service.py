@@ -1,14 +1,4 @@
-"""detection_service.py – drop‑in replacement for the old
-`lib.mjpeg_detection.motion_processor` module.
 
-Highlights
-==========
-* **All logic lives inside a `DetectionService` class** → no global state races.
-* **Direct YOLO detection** → no OpenCV motion detection overhead.
-* **Configurable frame skipping** → tune performance via DETECT_EVERY env var.
-* Background threads are started *once* (lazy‑initialised) and shut down cleanly
-  on `toggle_detection(False)` or program exit.
-"""
 from __future__ import annotations
 
 import json
@@ -39,12 +29,12 @@ log = logging.getLogger("detection")
 @dataclass
 class Config:
     # YOLO
-    model_path: str = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
+    model_path: str = os.getenv("YOLO_MODEL_PATH", "yolov8m.pt")
     cat_class_id: int = int(os.getenv("CAT_CLASS_ID", 15))
     yolo_conf: float = float(os.getenv("YOLO_CONF", 0.5))
 
-    # Film strip timing
-    film_interval: float = float(os.getenv("FILM_STRIP_INTERVAL", 30))  # s
+    # time‑bucket size for film‑strip (seconds)
+    film_interval: float = float(os.getenv("FILM_STRIP_INTERVAL", 30))
     film_window: float = float(os.getenv("FILM_STRIP_WINDOW", 180))
 
     # Film strip layout
@@ -57,14 +47,25 @@ class Config:
     # Sleeping‑cat periodic scan
     periodic_interval: float = 30.0  # s
 
-    # NEW – only run YOLO every N frames
-    detect_every: int = int(os.getenv("DETECT_EVERY", 5))
+    # YOLO only every N frames  (60 = 1 Hz on typical 60 fps feed)
+    detect_every: int = int(os.getenv("DETECT_EVERY", 60))
 
     # Optional second‑pass upscale factor for tiny cameras (e.g. 2 → 2×)
     upscale_factor: int = int(os.getenv("UPSCALE_FACTOR", 1))
 
+    # Pixels to crop from the bottom of every frame (exclude detection strip)
+    bottom_crop_px: int = int(os.getenv("BOTTOM_CROP_PX", 270))
+
+    # Log summary every N seconds
+    log_interval: int = int(os.getenv("LOG_INTERVAL", 10))
+
     # I/O root
     root_dir: Path = Path(os.getenv("MOTION_ROOT", "motion_logs"))
+
+    # --- debugging ----------------------------------------------------
+    # Enable to dump every YOLO input frame to disk (rotating buffer of 50)
+    debug_frames: bool = bool(int(os.getenv("DEBUG_FRAMES", "0")))
+    debug_dir: Path = Path(os.getenv("DEBUG_DIR", "motion_logs/debug"))
 
     @property
     def crop_dir(self) -> Path:
@@ -81,7 +82,8 @@ class Config:
 def _makedirs(cfg: Config):
     cfg.root_dir.mkdir(parents=True, exist_ok=True)
     cfg.crop_dir.mkdir(parents=True, exist_ok=True)
-    
+    if cfg.debug_frames:
+        cfg.debug_dir.mkdir(parents=True, exist_ok=True)
     # Clean up any old PNG files
     old_png = cfg.root_dir / "detections_strip.png"
     if old_png.exists():
@@ -110,14 +112,41 @@ class CatDetector:
         self.cfg = cfg
 
     def __call__(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        # Optionally crop bottom strip (e.g. 270 px filmstrip)
+        if self.cfg.bottom_crop_px and frame.shape[0] > self.cfg.bottom_crop_px:
+            frame = frame[:-self.cfg.bottom_crop_px, :]
+        # save raw YOLO input for inspection
+        if self.cfg.debug_frames:
+            ts = time.strftime("%H%M%S")
+            cv2.imwrite(str(self.cfg.debug_dir / f"yolo_in_{ts}.jpg"), frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            # keep only last 50 files
+            files = sorted(self.cfg.debug_dir.glob("yolo_in_*.jpg"))
+            for old in files[:-50]:
+                old.unlink(missing_ok=True)
         """Run YOLO once; if nothing is found and an upscale_factor > 1 is
         configured, run a second pass on an up‑sampled copy to catch small
         cats in 320‑pixel sub‑views."""
         if not self.model:
+            # save an annotated preview
+            if self.cfg.debug_frames and []:
+                preview = frame.copy()
+                ts = time.strftime("%H%M%S")
+                for (x1,y1,x2,y2) in []:
+                    ts = time.strftime("%H%M%S")
+                    cv2.rectangle(preview, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.imwrite(str(self.cfg.debug_dir / f"yolo_out_{ts}.jpg"), preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return []
 
         boxes = self._detect(frame)
         if boxes or self.cfg.upscale_factor <= 1:
+            # save an annotated preview
+            if self.cfg.debug_frames and boxes:
+                preview = frame.copy()
+                ts = time.strftime("%H%M%S")
+                for (x1,y1,x2,y2) in boxes:
+                    ts = time.strftime("%H%M%S")
+                    cv2.rectangle(preview, (x1,y1), (x2,y2), (0,255,0), 2)
+                cv2.imwrite(str(self.cfg.debug_dir / f"yolo_out_{ts}.jpg"), preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return boxes
 
         # second‑pass upscale
@@ -128,10 +157,25 @@ class CatDetector:
             boxes_up = self._detect(up)
             # map back to original coords
             scale = 1 / self.cfg.upscale_factor
-            return [(int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale))
+            mapped_boxes = [(int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale))
                     for x1, y1, x2, y2 in boxes_up]
+            # save an annotated preview
+            if self.cfg.debug_frames and mapped_boxes:
+                preview = frame.copy()
+                for (x1,y1,x2,y2) in mapped_boxes:
+                    cv2.rectangle(preview, (x1,y1), (x2,y2), (0,255,0), 2)
+                ts = time.strftime("%H%M%S")
+                cv2.imwrite(str(self.cfg.debug_dir / f"yolo_out_{ts}.jpg"), preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
+            return mapped_boxes
         except Exception as e:
             log.error("Upscale detection error: %s", e)
+            # save an annotated preview
+            if self.cfg.debug_frames and boxes:
+                preview = frame.copy()
+                for (x1,y1,x2,y2) in boxes:
+                    cv2.rectangle(preview, (x1,y1), (x2,y2), (0,255,0), 2)
+                ts = time.strftime("%H%M%S")
+                cv2.imwrite(str(self.cfg.debug_dir / f"yolo_out_{ts}.jpg"), preview, [cv2.IMWRITE_JPEG_QUALITY, 90])
             return boxes  # fall back to first‑pass result
 
     # --- helper -----------------------------------------------------------
@@ -170,28 +214,31 @@ class FilmStrip:
         self._render_blank()
 
     # ---------- public
-    def maybe_save(self, frame: np.ndarray, boxes: List[Tuple[int, int, int, int]]):
-        now = time.time()
-        if not boxes or now - self.last_save < self.cfg.film_interval:
-            return
-        self._purge_old()
+    def maybe_save(self, frame: np.ndarray, boxes: List[Tuple[int, int, int, int]]) -> bool:
+        if not boxes:
+            return False
         self._save_largest(frame, boxes)
-        self.last_save = now
+        self._purge_old()
         self._render()
+        return True
 
     def refresh(self):
         self._render()
 
     # ---------- helpers
     def _purge_old(self):
-        cutoff = time.time() - self.cfg.film_window
-        for p in self.cfg.crop_dir.glob("filmstrip_*.jpg"):
-            try:
-                if p.stat().st_mtime < cutoff:
-                    p.unlink(missing_ok=True)
-                    log.debug("Removed old detection image: %s", p.name)
-            except OSError:
-                pass
+        files = sorted(self.cfg.crop_dir.glob("filmstrip_*.jpg"),
+                       key=lambda p: p.stat().st_mtime)
+        cutoff = time.time() - self.cfg.film_window  # 180 s default
+        # 1) age‑based purge
+        for p in files:
+            if p.stat().st_mtime < cutoff:
+                p.unlink(missing_ok=True)
+        # 2) hard‑cap newest 200 to avoid disk bloat
+        files = sorted(self.cfg.crop_dir.glob("filmstrip_*.jpg"),
+                       key=lambda p: p.stat().st_mtime)
+        for old in files[:-200]:
+            old.unlink(missing_ok=True)
 
     def _save_largest(self, frame, boxes):
         x1, y1, x2, y2 = max(boxes, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
@@ -215,7 +262,22 @@ class FilmStrip:
         cv2.imwrite(str(jpg_file), blank, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     def _render(self):
-        files = sorted(self.cfg.crop_dir.glob("filmstrip_*.jpg"), key=lambda p: p.stat().st_mtime)[-self.cfg.strip_max_images:]
+        all_files = sorted(self.cfg.crop_dir.glob("filmstrip_*.jpg"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+
+        # pick newest file in each film_interval bucket, up to strip_max_images
+        files: List[Path] = []
+        seen_buckets = set()
+        for fp in all_files:
+            bucket = int(fp.stat().st_mtime // self.cfg.film_interval)
+            if bucket in seen_buckets:
+                continue
+            seen_buckets.add(bucket)
+            files.append(fp)
+            if len(files) == self.cfg.strip_max_images:
+                break
+
+        files = list(reversed(files))  # oldest -> newest for left→right rendering
         canvas = np.zeros((self.cfg.strip_height, self.cfg.strip_width, 3), dtype=np.uint8)
         
         if not files:
@@ -328,7 +390,6 @@ class DetectionService:
         self.queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=50)
         self.running = False
         self._worker: Optional[threading.Thread] = None
-        self._periodic: Optional[threading.Thread] = None
         self._latest: Optional[np.ndarray] = None
         
         # Frame stats - NEW: track frames seen
@@ -336,6 +397,10 @@ class DetectionService:
         self._frames_processed = 0
         self._frames_dropped = 0
         self._last_stats_time = time.time()
+        # new counters for logging frequency
+        self._det_checks = 0
+        self._film_saves = 0
+        self._log_interval = self.cfg.log_interval
 
     # ------------ control --------------
     def start(self):
@@ -344,10 +409,11 @@ class DetectionService:
         self.running = True
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
         self._worker.start()
-        self._periodic = threading.Thread(target=self._periodic_loop, daemon=True)
-        self._periodic.start()
         log.info("Detection threads started")
-        print(f"Detection service started - will process every {self.cfg.detect_every} frames")
+        print(
+            f"Detection service started – running YOLO every {self.cfg.detect_every} "
+            f"frames (~{60/self.cfg.detect_every:.1f} detections/sec at 60 fps)"
+        )
 
     def stop(self):
         if not self.running:
@@ -356,8 +422,6 @@ class DetectionService:
         self.queue.put(None)
         if self._worker:
             self._worker.join(timeout=2)
-        if self._periodic:
-            self._periodic.join(timeout=2)
         log.info("Detection threads stopped")
 
     def enqueue(self, jpeg: bytes):
@@ -409,7 +473,10 @@ class DetectionService:
                 "frames_seen": self._frames_seen,  # NEW
                 "frames_processed": self._frames_processed,
                 "frames_dropped": self._frames_dropped,
-                "drop_rate_percent": round(drop_rate, 1)
+                "drop_rate_percent": round(drop_rate, 1),
+                "detections_per_sec_est": round(60 / self.cfg.detect_every, 1),
+                "yolo_runs_last_interval": self._det_checks,
+                "film_saves_last_interval": self._film_saves,
             },
             "film_strip": {
                 "images_count": len(list(self.cfg.crop_dir.glob("filmstrip_*.jpg"))),
@@ -434,6 +501,17 @@ class DetectionService:
                 continue
             except Exception as e:
                 log.error("Worker loop error: %s", e)
+            # periodic stats log
+            if time.time() - self._last_stats_time >= self._log_interval:
+                det_rate = self._det_checks / self._log_interval
+                save_rate = self._film_saves / self._log_interval
+                log.info(
+                    "Detection summary: %.1f YOLO runs/sec, %.2f strip saves/sec "
+                    "(queue %d)", det_rate, save_rate, self.queue.qsize()
+                )
+                self._det_checks = 0
+                self._film_saves = 0
+                self._last_stats_time = time.time()
 
     def _process_frame(self, jpeg: bytes):
         try:
@@ -447,35 +525,22 @@ class DetectionService:
 
             # ➜ frame-skipping: heavy work only every Nth frame
             self._frames_seen += 1
+            # count how many times we actually run YOLO
             if self._frames_seen % self.cfg.detect_every:
                 return  # skip this one – just counted
+
+            self._det_checks += 1  # YOLO run
 
             # run YOLO directly – no motion first
             boxes = self.cats(frame)
             if boxes:
                 self._log_event("cat_detected", len(boxes))
-                self.film.maybe_save(frame, boxes)
-                print(f"Cat detected! Found {len(boxes)} cats")
+                saved = self.film.maybe_save(frame, boxes)
+                if saved:
+                    self._film_saves += 1
 
         except Exception as e:
             log.error("Frame processing error: %s", e)
-
-    def _periodic_loop(self):
-        while self.running:
-            try:
-                time.sleep(self.cfg.periodic_interval)
-                if not self.running or self._latest is None:
-                    continue
-                    
-                log.debug("Performing periodic cat check")
-                boxes = self.cats(self._latest)
-                if boxes:
-                    log.info("Periodic check found %d cat(s)", len(boxes))
-                    self._log_event("periodic_cat_detected", len(boxes))
-                    self.film.maybe_save(self._latest, boxes)
-                    
-            except Exception as e:
-                log.error("Periodic loop error: %s", e)
 
     def _log_event(self, event_type: str, count: int = 0):
         try:
