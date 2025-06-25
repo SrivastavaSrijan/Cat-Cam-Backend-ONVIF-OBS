@@ -194,7 +194,6 @@ def _read_frames():
     frame_data = b""
     consecutive_empty_reads = 0
     max_empty_reads = 10
-    frame_count = 0  # Add frame counter for detection throttling
     
     while streaming_active and ffmpeg_process:
         try:
@@ -225,12 +224,8 @@ def _read_frames():
                 frame_data = frame_data[end_pos + 2:]
                 
                 if len(frame) > 500:
-                    frame_count += 1
-                    
-                    # Send to detection only every 5th frame (reduce load)
-                    should_detect = (frame_count % 5 == 0)
-                    
-                    if DETECTION_AVAILABLE and should_detect:
+                    # Send ALL frames to detection - let detection service handle skipping
+                    if DETECTION_AVAILABLE:
                         frame = process_frame_for_detection(frame)
                     
                     with frame_lock:
@@ -486,4 +481,6 @@ if __name__ == "__main__":
         print("Detection strip will be saved to: motion_logs/detections_strip.jpg")
     else:
         print("Detection module not available - streaming only")
-    app.run(host="0.0.0.0", port=8080, debug=False)
+        print("Cropped detections will be saved to: motion_logs/crops/")
+        print("Detection strip will be saved to: motion_logs/detections_strip.jpg")
+    app.run(host="0.0.0.0", port=8081, debug=False)

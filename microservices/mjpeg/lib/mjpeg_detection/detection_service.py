@@ -4,13 +4,10 @@
 Highlights
 ==========
 * **All logic lives inside a `DetectionService` class** → no global state races.
-* **Public functional wrappers** at the bottom keep the *exact* old API so
-  `app.py` (or any other caller) can continue `from detection_service import
-  process_frame_for_detection, init_detection, …` with zero code changes.
+* **Direct YOLO detection** → no OpenCV motion detection overhead.
+* **Configurable frame skipping** → tune performance via DETECT_EVERY env var.
 * Background threads are started *once* (lazy‑initialised) and shut down cleanly
   on `toggle_detection(False)` or program exit.
-* Uses `logging` instead of naked `print` for easier integration with whatever
-  log stack you prefer.
 """
 from __future__ import annotations
 
@@ -41,10 +38,6 @@ log = logging.getLogger("detection")
 
 @dataclass
 class Config:
-    # Motion
-    motion_threshold: int = int(os.getenv("MOTION_THRESHOLD", 25))
-    pixel_threshold: int = int(os.getenv("MOTION_PIXEL_THRESHOLD", 1000))
-
     # YOLO
     model_path: str = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
     cat_class_id: int = int(os.getenv("CAT_CLASS_ID", 15))
@@ -64,6 +57,12 @@ class Config:
     # Sleeping‑cat periodic scan
     periodic_interval: float = 30.0  # s
 
+    # NEW – only run YOLO every N frames
+    detect_every: int = int(os.getenv("DETECT_EVERY", 5))
+
+    # Optional second‑pass upscale factor for tiny cameras (e.g. 2 → 2×)
+    upscale_factor: int = int(os.getenv("UPSCALE_FACTOR", 1))
+
     # I/O root
     root_dir: Path = Path(os.getenv("MOTION_ROOT", "motion_logs"))
 
@@ -73,7 +72,7 @@ class Config:
 
     @property
     def strip_file(self) -> Path:
-        return self.root_dir / "detections_strip.jpg"  # Changed from PNG to JPG
+        return self.root_dir / "detections_strip.jpg"
 
 ###############################################################################
 # Internal helpers
@@ -90,29 +89,7 @@ def _makedirs(cfg: Config):
         print(f"Removed old PNG file: {old_png}")
 
 ###############################################################################
-# Motion detector
-###############################################################################
-
-class MotionDetector:
-    def __init__(self, cfg: Config):
-        self.cfg = cfg
-        self.prev: Optional[np.ndarray] = None
-        self._lock = threading.Lock()
-
-    def __call__(self, frame: np.ndarray) -> bool:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        with self._lock:
-            if self.prev is None:
-                self.prev = gray
-                return False
-            diff = cv2.absdiff(self.prev, gray)
-            self.prev = gray
-        diff = cv2.GaussianBlur(diff, (5, 5), 0)
-        _, thr = cv2.threshold(diff, self.cfg.motion_threshold, 255, cv2.THRESH_BINARY)
-        return cv2.countNonZero(thr) > self.cfg.pixel_threshold
-
-###############################################################################
-# Cat detector
+# Cat detector (no more motion detector!)
 ###############################################################################
 
 class CatDetector:
@@ -121,28 +98,57 @@ class CatDetector:
             try:
                 self.model = YOLO(cfg.model_path)
                 log.info("YOLO model loaded: %s", cfg.model_path)
+                print(f"YOLO model loaded: {cfg.model_path}")
             except Exception as e:
                 log.warning("Failed to load YOLO model %s: %s", cfg.model_path, e)
+                print(f"Failed to load YOLO model: {e}")
                 self.model = None
         else:
             self.model = None
             log.warning("ultralytics not installed – cat detection disabled")
+            print("ultralytics not installed – cat detection disabled")
         self.cfg = cfg
 
     def __call__(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Run YOLO once; if nothing is found and an upscale_factor > 1 is
+        configured, run a second pass on an up‑sampled copy to catch small
+        cats in 320‑pixel sub‑views."""
         if not self.model:
             return []
-        try:
-            result = self.model.predict(frame, conf=self.cfg.yolo_conf, classes=[self.cfg.cat_class_id], verbose=False)
-            boxes: List[Tuple[int, int, int, int]] = []
-            for r in result:
-                if r.boxes is not None:
-                    for b in r.boxes:
-                        x1, y1, x2, y2 = b.xyxy[0].cpu().numpy()
-                        boxes.append((int(x1), int(y1), int(x2), int(y2)))
+
+        boxes = self._detect(frame)
+        if boxes or self.cfg.upscale_factor <= 1:
             return boxes
+
+        # second‑pass upscale
+        try:
+            up = cv2.resize(frame, None, fx=self.cfg.upscale_factor,
+                            fy=self.cfg.upscale_factor,
+                            interpolation=cv2.INTER_CUBIC)
+            boxes_up = self._detect(up)
+            # map back to original coords
+            scale = 1 / self.cfg.upscale_factor
+            return [(int(x1*scale), int(y1*scale), int(x2*scale), int(y2*scale))
+                    for x1, y1, x2, y2 in boxes_up]
         except Exception as e:
-            log.error("Cat detection error: %s", e)
+            log.error("Upscale detection error: %s", e)
+            return boxes  # fall back to first‑pass result
+
+    # --- helper -----------------------------------------------------------
+    def _detect(self, img: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        try:
+            res = self.model.predict(img,
+                                     conf=self.cfg.yolo_conf,
+                                     classes=[self.cfg.cat_class_id],
+                                     verbose=False)
+            out: List[Tuple[int, int, int, int]] = []
+            for r in res:
+                for b in r.boxes or []:
+                    x1, y1, x2, y2 = b.xyxy[0].cpu().numpy()
+                    out.append((int(x1), int(y1), int(x2), int(y2)))
+            return out
+        except Exception as e:
+            log.error("YOLO predict error: %s", e)
             return []
 
 ###############################################################################
@@ -179,7 +185,6 @@ class FilmStrip:
     # ---------- helpers
     def _purge_old(self):
         cutoff = time.time() - self.cfg.film_window
-        # Use consistent filename pattern - filmstrip_ not film_
         for p in self.cfg.crop_dir.glob("filmstrip_*.jpg"):
             try:
                 if p.stat().st_mtime < cutoff:
@@ -204,33 +209,22 @@ class FilmStrip:
         log.debug("saved crop %s", fname)
 
     def _render_blank(self):
-        # Create black background JPG instead of transparent PNG
         blank = np.zeros((self.cfg.strip_height, self.cfg.strip_width, 3), dtype=np.uint8)
-        
-        # Make sure we're writing to JPG file
         jpg_file = self.cfg.strip_file
         print(f"Creating blank film strip at: {jpg_file}")
-        
         cv2.imwrite(str(jpg_file), blank, [cv2.IMWRITE_JPEG_QUALITY, 95])
 
     def _render(self):
-        # Use consistent filename pattern - filmstrip_ not film_
         files = sorted(self.cfg.crop_dir.glob("filmstrip_*.jpg"), key=lambda p: p.stat().st_mtime)[-self.cfg.strip_max_images:]
-        
-        # Create black background JPG canvas
         canvas = np.zeros((self.cfg.strip_height, self.cfg.strip_width, 3), dtype=np.uint8)
         
         if not files:
-            # Create waiting message on black background
             message = "Waiting for detections..."
             text_size = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
             text_x = self.cfg.strip_left_margin
             text_y = self.cfg.strip_height // 2 + 10
-            
-            # Add white text directly on black canvas
             cv2.putText(canvas, message, (text_x, text_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
             cv2.imwrite(str(self.cfg.strip_file), canvas, [cv2.IMWRITE_JPEG_QUALITY, 95])
             log.debug("Created blank film strip")
             return
@@ -251,8 +245,8 @@ class FilmStrip:
                 except ValueError:
                     txt = "??:??"
                 
-                # Calculate dimensions - reserve more space for timestamp overlay
-                img_height = self.cfg.strip_height - 50  # More space for text overlay
+                # Calculate dimensions
+                img_height = self.cfg.strip_height - 50
                 h, w = img.shape[:2]
                 
                 # Scale to fit
@@ -271,26 +265,24 @@ class FilmStrip:
                     resized = cv2.resize(img, (new_width, new_height))
                     
                     # Position image in canvas
-                    img_y = 10  # Start from top with some margin
+                    img_y = 10
                     end_x = min(x + new_width, self.cfg.strip_width)
-                    end_y = min(img_y + new_height, self.cfg.strip_height - 40)  # Leave space for text
+                    end_y = min(img_y + new_height, self.cfg.strip_height - 40)
                     
                     if x < self.cfg.strip_width:
                         # Place image directly on black canvas
                         canvas[img_y:end_y, x:end_x] = resized[:end_y-img_y, :end_x-x]
                         
-                        # Add timestamp overlay with black background directly on the image
+                        # Add timestamp
                         text_size = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
                         text_x = x + (new_width - text_size[0]) // 2
-                        text_y = end_y + 25  # Below the image
+                        text_y = end_y + 25
                         
-                        # Draw black rectangle for text background
                         cv2.rectangle(canvas, 
                                     (text_x - 5, text_y - 18), 
                                     (text_x + text_size[0] + 5, text_y + 5), 
                                     (0, 0, 0), -1)
                         
-                        # Add white text on black background
                         cv2.putText(canvas, txt, (text_x, text_y), 
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
                         
@@ -309,21 +301,16 @@ class FilmStrip:
             info_x = self.cfg.strip_width - text_size[0] - 20
             info_y = self.cfg.strip_height - 10
             
-            # Black background for info text
             cv2.rectangle(canvas, 
                         (info_x - 5, info_y - 15), 
                         (info_x + text_size[0] + 5, info_y + 3), 
                         (0, 0, 0), -1)
             
-            # White text
             cv2.putText(canvas, info_text, (info_x, info_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
         
-        # Make sure we're writing to JPG file
         jpg_file = self.cfg.strip_file
         print(f"Updating film strip at: {jpg_file}")
-        
-        # Save as high-quality JPG
         cv2.imwrite(str(jpg_file), canvas, [cv2.IMWRITE_JPEG_QUALITY, 95])
         log.debug("Updated film strip with %d detections", len(files))
 
@@ -334,19 +321,18 @@ class FilmStrip:
 class DetectionService:
     def __init__(self, cfg: Optional[Config] = None):
         self.cfg = cfg or Config()
-        self.motion = MotionDetector(self.cfg)
-        self.cats = CatDetector(self.cfg)
+        self.cats = CatDetector(self.cfg)  # Only cat detector now!
         self.film = FilmStrip(self.cfg)
 
-        # Smaller queue with smart dropping strategy
-        self.queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=5)
+        # Bigger queue - no more artificial bottleneck
+        self.queue: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=50)
         self.running = False
         self._worker: Optional[threading.Thread] = None
         self._periodic: Optional[threading.Thread] = None
-        self._last_motion = 0.0
         self._latest: Optional[np.ndarray] = None
         
-        # Frame dropping stats
+        # Frame stats - NEW: track frames seen
+        self._frames_seen = 0
         self._frames_processed = 0
         self._frames_dropped = 0
         self._last_stats_time = time.time()
@@ -361,6 +347,7 @@ class DetectionService:
         self._periodic = threading.Thread(target=self._periodic_loop, daemon=True)
         self._periodic.start()
         log.info("Detection threads started")
+        print(f"Detection service started - will process every {self.cfg.detect_every} frames")
 
     def stop(self):
         if not self.running:
@@ -376,37 +363,33 @@ class DetectionService:
     def enqueue(self, jpeg: bytes):
         """Smart frame enqueueing with adaptive dropping"""
         try:
-            # Try to put frame without blocking
             self.queue.put_nowait(jpeg)
             self._frames_processed += 1
         except queue.Full:
-            # Queue is full - implement smart dropping
             self._frames_dropped += 1
             
             # Clear old frames and add new one (keep only latest)
             try:
-                # Remove oldest frame if queue is full
                 self.queue.get_nowait()
                 self.queue.put_nowait(jpeg)
                 self._frames_processed += 1
             except queue.Empty:
-                # Queue became empty between checks, just add the frame
                 try:
                     self.queue.put_nowait(jpeg)
                     self._frames_processed += 1
                 except queue.Full:
-                    # Still full, drop this frame
                     pass
             
-            # Log stats periodically instead of every drop
+            # Log stats periodically
             now = time.time()
-            if now - self._last_stats_time > 10:  # Log every 10 seconds
+            if now - self._last_stats_time > 10:
                 total = self._frames_processed + self._frames_dropped
                 drop_rate = (self._frames_dropped / total * 100) if total > 0 else 0
-                log.info("Detection stats: %d processed, %d dropped (%.1f%% drop rate)", 
-                        self._frames_processed, self._frames_dropped, drop_rate)
+                log.info("Detection stats: %d seen, %d processed, %d dropped (%.1f%% drop rate)", 
+                        self._frames_seen, self._frames_processed, self._frames_dropped, drop_rate)
                 self._last_stats_time = now
                 # Reset counters
+                self._frames_seen = 0
                 self._frames_processed = 0
                 self._frames_dropped = 0
 
@@ -421,7 +404,9 @@ class DetectionService:
             "crop_dir": str(self.cfg.crop_dir),
             "async_processing": self.running,
             "queue_size": self.queue.qsize(),
+            "detect_every": self.cfg.detect_every,
             "processing_stats": {
+                "frames_seen": self._frames_seen,  # NEW
                 "frames_processed": self._frames_processed,
                 "frames_dropped": self._frames_dropped,
                 "drop_rate_percent": round(drop_rate, 1)
@@ -440,7 +425,6 @@ class DetectionService:
     def _worker_loop(self):
         while self.running:
             try:
-                # Shorter timeout to process frames faster
                 item = self.queue.get(timeout=0.5)
                 if item is None:  # Poison pill
                     break
@@ -457,26 +441,22 @@ class DetectionService:
             frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
             if frame is None:
                 return
-            
-            # Always update latest frame for periodic checks
-            self._latest = frame.copy()
-            
-            # Skip motion detection on every Nth frame to reduce load
-            skip_motion = (self._frames_processed % 3 != 0)  # Only check motion every 3rd frame
-            
-            if not skip_motion:
-                # Check motion
-                motion = self.motion(frame)
-                if motion:
-                    self._last_motion = time.time()
-                    self._log_event("motion")
-                    
-                    # Check for cats only when motion is detected
-                    boxes = self.cats(frame)
-                    if boxes:
-                        self._log_event("cat_detected", len(boxes))
-                        self.film.maybe_save(frame, boxes)
-                    
+
+            # always remember latest (for periodic thread)
+            self._latest = frame
+
+            # ➜ frame-skipping: heavy work only every Nth frame
+            self._frames_seen += 1
+            if self._frames_seen % self.cfg.detect_every:
+                return  # skip this one – just counted
+
+            # run YOLO directly – no motion first
+            boxes = self.cats(frame)
+            if boxes:
+                self._log_event("cat_detected", len(boxes))
+                self.film.maybe_save(frame, boxes)
+                print(f"Cat detected! Found {len(boxes)} cats")
+
         except Exception as e:
             log.error("Frame processing error: %s", e)
 
@@ -528,10 +508,10 @@ def init_detection():
         _service = DetectionService()
         _service.start()  # Auto-start the service
         log.info("Detection service initialized and auto-enabled")
-        print("Detection service initialized and auto-enabled")  # Keep print for app.py
+        print("Detection service initialized and auto-enabled")
     except Exception as e:
         log.error("Detection initialization failed: %s", e)
-        print(f"Detection initialization failed: {e}")  # Keep print for app.py
+        print(f"Detection initialization failed: {e}")
         raise e
 
 def process_frame_for_detection(jpeg_frame: bytes) -> bytes:
@@ -568,13 +548,6 @@ def refresh_film_strip() -> dict:
         return {"success": False, "error": "Service not initialized"}
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-# Legacy functions for compatibility
-def detect_motion(gray_frame):
-    """Legacy function - use DetectionService instead"""
-    if _service:
-        return _service.motion(cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR) if len(gray_frame.shape) == 2 else gray_frame)
-    return False
 
 def detect_cats(frame):
     """Legacy function - use DetectionService instead"""
