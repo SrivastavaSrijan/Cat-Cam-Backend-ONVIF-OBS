@@ -4,268 +4,201 @@ FFmpeg MJPEG streaming service with integrated motion detection.
 Streams video from OBS Virtual Camera with optional cat detection overlay.
 """
 
-# Standard library imports
 import json
 import os
-import queue
 import re
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
+from typing import Optional
 
-# Third-party imports
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
-# Import our detection module
+# ---------------------------------------------------------------------------
+# Detection module (class‑based).  Wrapper functions keep old API.
+# ---------------------------------------------------------------------------
+
 try:
-    from lib.mjpeg_detection.motion_processor import (
-        process_frame_for_detection, 
-        init_detection, 
-        toggle_detection, 
+    # Fix the import path - detection_service.py is in the same directory as app.py
+    from lib.mjpeg_detection.detection_service import (
+        process_frame_for_detection,
+        init_detection,
+        toggle_detection,
         get_detection_status,
         refresh_film_strip,
-        create_detections_strip
+        create_detections_strip,
     )
     DETECTION_AVAILABLE = True
-except ImportError as e:
-    print(f"Detection module not available: {e}")
+    print("Detection service imported successfully")
+except ImportError as exc:  # pragma: no cover – detection optional
+    print(f"Detection module not available: {exc}")
     DETECTION_AVAILABLE = False
+except Exception as exc:
+    print(f"Unexpected error importing detection: {exc}")
+    DETECTION_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Flask setup
+# ---------------------------------------------------------------------------
 
 app = Flask(__name__)
 CORS(app)
 
-# Global FFmpeg process
-ffmpeg_process = None
+# ---------------------------------------------------------------------------
+# Global FFmpeg state (kept minimal – could be refactored later)
+# ---------------------------------------------------------------------------
+
+FFMPEG_BIN = Path(os.getenv("FFMPEG_BIN", "/opt/homebrew/bin/ffmpeg"))
+
+ffmpeg_process: Optional[subprocess.Popen] = None
 streaming_active = False
-frame_reader_thread = None
-monitor_thread = None
-stderr_reader_thread = None
-latest_frame = None
+latest_frame: Optional[bytes] = None
+
 frame_lock = threading.Lock()
-restart_lock = threading.Lock()
 
-# Initialize detection on startup (auto-enable if available)
+# Background threads
+_reader_th: Optional[threading.Thread] = None
+_stderr_th: Optional[threading.Thread] = None
+
+# ---------------------------------------------------------------------------
+# Init detection if available
+# ---------------------------------------------------------------------------
+
 if DETECTION_AVAILABLE:
-    init_detection()
-    print("Motion detection auto-enabled and ready")
-
-def get_obs_camera_index():
-    """Find OBS Virtual Camera by name instead of guessing index"""
     try:
-        # List all video devices
-        cmd = ['/opt/homebrew/bin/ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', '']
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        
-        # Parse the output to find OBS Virtual Camera
-        lines = result.stderr.split('\n')
-        for line in lines:
-            # Look for lines like "[0] OBS Virtual Camera"
-            match = re.search(r'\[(\d+)\].*OBS Virtual Camera', line, re.IGNORECASE)
-            if match:
-                index = int(match.group(1))
-                print(f"Found OBS Virtual Camera at index {index}")
-                return str(index)
-        
-        # Fallback to common indices if not found by name
-        print("OBS Virtual Camera not found by name, trying common indices...")
-        for test_index in ['0', '1', '2']:
-            if test_camera_index(test_index):
-                print(f"Using camera index {test_index} as fallback")
-                return test_index
-        
-        raise Exception("No working camera found")
-        
+        init_detection()  # spins up background worker threads and auto-enables
+        print("Motion detection auto-initialized and enabled")
+    except Exception as e:
+        print(f"Failed to initialize detection: {e}")
+        DETECTION_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Camera helpers
+# ---------------------------------------------------------------------------
+
+def _detect_obs_cam() -> str:
+    """Return avfoundation index of OBS Virtual Camera (fallback to '0')."""
+    cmd = [str(FFMPEG_BIN), "-f", "avfoundation", "-list_devices", "true", "-i", ""]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        for line in res.stderr.split("\n"):
+            m = re.search(r"\[(\d+)\].*OBS Virtual Camera", line, re.I)
+            if m:
+                print(f"Found OBS Virtual Camera at index {m.group(1)}")
+                return m.group(1)
+        print("OBS Virtual Camera not found by name, using fallback")
     except Exception as e:
         print(f"Error finding OBS camera: {e}")
-        # Last resort fallback
-        return '0'
+    return "0"
 
-def test_camera_index(index):
-    """Test if a camera index works"""
-    try:
-        cmd = [
-            '/opt/homebrew/bin/ffmpeg', '-f', 'avfoundation', '-framerate', '30', 
-            '-i', index, '-frames:v', '1', '-f', 'null', '-'
-        ]
-        result = subprocess.run(cmd, capture_output=True, timeout=5)
-        return result.returncode == 0
-    except:
-        return False
+# ---------------------------------------------------------------------------
+# FFmpeg helpers
+# ---------------------------------------------------------------------------
 
-def read_ffmpeg_stderr():
-    """Read and log FFmpeg stderr output"""
-    global ffmpeg_process, streaming_active
+def _ffmpeg_cmd(cam: str) -> list[str]:
+    return [
+        str(FFMPEG_BIN),
+        "-f", "avfoundation",
+        "-framerate", "60",
+        "-pixel_format", "nv12",
+        "-i", cam,
+        "-vf", "scale=1280:720:flags=fast_bilinear",
+        "-f", "mjpeg",
+        "-q:v", "6",
+        "-threads", "1",
+        "-fflags", "+nobuffer+flush_packets+genpts",
+        "-flags", "+low_delay",
+        "-strict", "experimental",
+        "-avoid_negative_ts", "make_zero",
+        "-tune", "zerolatency",
+        "pipe:1",
+    ]
+
+def _start_ffmpeg():
+    global ffmpeg_process, _reader_th, _stderr_th
+    cam = _detect_obs_cam()
+    print(f"Starting FFmpeg with camera {cam}")
     
+    ffmpeg_process = subprocess.Popen(
+        _ffmpeg_cmd(cam),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        preexec_fn=os.setsid,
+    )
+    
+    _reader_th = threading.Thread(target=_read_frames, daemon=True)
+    _reader_th.start()
+    _stderr_th = threading.Thread(target=_read_stderr, daemon=True)
+    _stderr_th.start()
+    
+    print(f"FFmpeg process started with PID {ffmpeg_process.pid}")
+
+def _stop_ffmpeg():
+    global ffmpeg_process, _reader_th, _stderr_th, latest_frame
+    if not ffmpeg_process:
+        return
+    
+    try:
+        os.killpg(os.getpgid(ffmpeg_process.pid), signal.SIGTERM)
+        ffmpeg_process.wait(timeout=5)
+    except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+        try:
+            os.killpg(os.getpgid(ffmpeg_process.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    
+    ffmpeg_process = None
+    
+    # Wait for threads to finish
+    if _reader_th and _reader_th.is_alive():
+        _reader_th.join(timeout=3)
+    if _stderr_th and _stderr_th.is_alive():
+        _stderr_th.join(timeout=3)
+    
+    _reader_th = None
+    _stderr_th = None
+    
+    with frame_lock:
+        latest_frame = None
+    
+    print("Stopped FFmpeg stream")
+
+# ---------------------------------------------------------------------------
+# Reader threads
+# ---------------------------------------------------------------------------
+
+def _read_stderr():
     if not ffmpeg_process or not ffmpeg_process.stderr:
         return
     
     try:
-        # Create log file for FFmpeg output
-        log_file = '/tmp/ffmpeg_output.log'
-        
-        with open(log_file, 'a') as f:
-            f.write(f"\n=== FFmpeg started at {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-            
-            while streaming_active and ffmpeg_process:
-                try:
-                    line = ffmpeg_process.stderr.readline()
-                    if not line:
-                        break
-                    
-                    decoded_line = line.decode('utf-8', errors='ignore').strip()
-                    if decoded_line:
-                        # Write to log file
-                        f.write(f"{time.strftime('%H:%M:%S')}: {decoded_line}\n")
-                        f.flush()
-                        
-                        # Also print important messages
-                        if any(keyword in decoded_line.lower() for keyword in 
-                               ['error', 'failed', 'warning', 'fps=', 'time=']):
-                            print(f"FFmpeg: {decoded_line}")
-                            
-                except Exception as e:
-                    f.write(f"Error reading stderr: {e}\n")
-                    break
-                    
+        for line in ffmpeg_process.stderr:
+            if not streaming_active:
+                break
+            decoded_line = line.decode(errors="ignore").strip()
+            if decoded_line and any(keyword in decoded_line.lower() for keyword in 
+                                   ['error', 'failed', 'warning', 'fps=', 'time=']):
+                print(f"FFmpeg: {decoded_line}")
     except Exception as e:
         print(f"Error in stderr reader: {e}")
-    
-    print("FFmpeg stderr reader stopped")
 
-def get_base_url():
-    """Get base URL from the current request - localhost gets :8080, others use their own domain"""
-    if request:
-        host = request.host
-        scheme = request.scheme
-        
-        # If it's localhost, add port 8080
-        if 'localhost' in host or '127.0.0.1' in host:
-            # Remove any existing port and add 8080
-            host_without_port = host.split(':')[0]
-            return f"{scheme}://{host_without_port}:8080"
-        else:
-            # Use the host as-is (reverse proxy handles the domain)
-            return f"{scheme}://{host}/stream"
+def _read_frames():
+    global latest_frame
+    if not ffmpeg_process or not ffmpeg_process.stdout:
+        return
     
-    # Fallback if no request context
-    external_domain = os.getenv('EXTERNAL_DOMAIN')
-    if external_domain:
-        return f"https://{external_domain}/stream"
-    return "http://localhost:8080"
-
-def monitor_ffmpeg():
-    """Monitor FFmpeg process and restart if it dies"""
-    global ffmpeg_process, streaming_active
-    
-    while streaming_active:
-        try:
-            if ffmpeg_process and ffmpeg_process.poll() is not None:
-                print(f"FFmpeg died unexpectedly (exit code: {ffmpeg_process.poll()})")
-                
-                with restart_lock:
-                    if streaming_active:  # Double check we still want to be active
-                        print("Attempting to restart FFmpeg...")
-                        _restart_ffmpeg_internal()
-            
-            time.sleep(1)  # Check every second
-            
-        except Exception as e:
-            print(f"Monitor error: {e}")
-            break
-    
-    print("FFmpeg monitor stopped")
-
-def _restart_ffmpeg_internal():
-    """Internal restart function - called from monitor"""
-    global ffmpeg_process, frame_reader_thread, stderr_reader_thread
-    
-    try:
-        # Stop current process
-        if ffmpeg_process:
-            try:
-                ffmpeg_process.terminate()
-                ffmpeg_process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                ffmpeg_process.kill()
-            ffmpeg_process = None
-        
-        # Wait for threads to stop
-        if frame_reader_thread and frame_reader_thread.is_alive():
-            frame_reader_thread.join(timeout=2)
-        if stderr_reader_thread and stderr_reader_thread.is_alive():
-            stderr_reader_thread.join(timeout=2)
-        
-        # Small delay before restart
-        time.sleep(1)
-        
-        # Restart FFmpeg
-        _start_ffmpeg_process()
-        
-    except Exception as e:
-        print(f"Restart failed: {e}")
-        global streaming_active
-        streaming_active = False
-
-def _start_ffmpeg_process():
-    """Internal function to start FFmpeg process"""
-    global ffmpeg_process, frame_reader_thread, stderr_reader_thread
-    
-    # Find OBS camera by name
-    camera_index = get_obs_camera_index()
-    
-    cmd = [
-        '/opt/homebrew/bin/ffmpeg',  # Changed this line
-        '-f', 'avfoundation',
-        '-framerate', '60',
-        '-pixel_format', 'nv12',
-        '-i', camera_index,
-        '-vf', 'scale=1280:720:flags=fast_bilinear',
-        '-f', 'mjpeg',
-        '-q:v', '6',
-        '-threads', '1',
-        '-fflags', '+nobuffer+flush_packets+genpts',
-        '-flags', '+low_delay',
-        '-strict', 'experimental',
-        '-avoid_negative_ts', 'make_zero',
-        '-tune', 'zerolatency',
-        'pipe:1'
-    ]
-    
-    print(f"Starting FFmpeg with camera {camera_index}: {' '.join(cmd)}")
-    
-    ffmpeg_process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=0,
-        preexec_fn=os.setsid
-    )
-    
-    # Start frame reader thread
-    frame_reader_thread = threading.Thread(target=read_frames_from_ffmpeg, daemon=True)
-    frame_reader_thread.start()
-    
-    # Start stderr reader thread for logging
-    stderr_reader_thread = threading.Thread(target=read_ffmpeg_stderr, daemon=True)
-    stderr_reader_thread.start()
-
-def read_frames_from_ffmpeg():
-    """Read frames from FFmpeg and buffer them for multiple clients"""
-    global ffmpeg_process, streaming_active, latest_frame
-    
-    frame_data = b''
+    frame_data = b""
     consecutive_empty_reads = 0
     max_empty_reads = 10
+    frame_count = 0  # Add frame counter for detection throttling
     
     while streaming_active and ffmpeg_process:
         try:
-            if not ffmpeg_process.stdout:
-                break
-                
             chunk = ffmpeg_process.stdout.read(4096)
-            
             if not chunk:
                 consecutive_empty_reads += 1
                 if consecutive_empty_reads > max_empty_reads:
@@ -275,7 +208,7 @@ def read_frames_from_ffmpeg():
                 continue
             else:
                 consecutive_empty_reads = 0
-                
+            
             frame_data += chunk
             
             # Process frames immediately when found
@@ -283,24 +216,27 @@ def read_frames_from_ffmpeg():
                 start_pos = frame_data.find(b'\xff\xd8')
                 if start_pos == -1:
                     break
-                    
+                
                 end_pos = frame_data.find(b'\xff\xd9', start_pos)
                 if end_pos == -1:
                     break
-                    
-                jpeg_frame = frame_data[start_pos:end_pos + 2]
+                
+                frame = frame_data[start_pos:end_pos + 2]
                 frame_data = frame_data[end_pos + 2:]
                 
-                if len(jpeg_frame) > 500:
-                    # NEW: Process frame for detection (with fallback to original)
-                    if DETECTION_AVAILABLE:
-                        processed_frame = process_frame_for_detection(jpeg_frame)
-                    else:
-                        processed_frame = jpeg_frame
+                if len(frame) > 500:
+                    frame_count += 1
+                    
+                    # Send to detection only every 5th frame (reduce load)
+                    should_detect = (frame_count % 5 == 0)
+                    
+                    if DETECTION_AVAILABLE and should_detect:
+                        frame = process_frame_for_detection(frame)
                     
                     with frame_lock:
-                        latest_frame = processed_frame
+                        latest_frame = frame
                 
+                # Prevent buffer from growing too large
                 if len(frame_data) > 50000:
                     frame_data = frame_data[-25000:]
                     
@@ -310,267 +246,167 @@ def read_frames_from_ffmpeg():
     
     print("Frame reader stopped")
 
-def start_ffmpeg_stream():
-    """Start FFmpeg MJPEG stream - Find OBS Virtual Camera by name"""
-    global ffmpeg_process, streaming_active, monitor_thread
+# ---------------------------------------------------------------------------
+# Flask helpers
+# ---------------------------------------------------------------------------
+
+def _base_url() -> str:
+    if not request:
+        return "http://localhost:8080"
+    host = request.host.split(":")[0]
+    scheme = request.scheme
+    if host in ("localhost", "127.0.0.1"):
+        return f"{scheme}://{host}:8080"
+    else:
+        # Use the host as-is (reverse proxy handles the domain)
+        return f"{scheme}://{request.host}/stream"
+
+# ---------------------------------------------------------------------------
+# Flask routes
+# ---------------------------------------------------------------------------
+
+# Streaming ------------------------------------------------------------------
+
+@app.route("/stream")
+def stream():
+    if not streaming_active:
+        _start_stream()
+        time.sleep(1)
+        if not streaming_active:
+            return jsonify({"error": "Streaming is not active"}), 503
     
-    if ffmpeg_process is not None:
-        print("FFmpeg already running, skipping start")
-        return
+    return Response(_frame_generator(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+def _frame_generator():
+    no_frame_count = 0
+    while streaming_active:
+        with frame_lock:
+            frame = latest_frame
+        
+        if frame:
+            yield (
+                b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                + str(len(frame)).encode()
+                + b"\r\n\r\n"
+                + frame
+                + b"\r\n"
+            )
+            no_frame_count = 0
+            time.sleep(1 / 60)
+        else:
+            no_frame_count += 1
+            if no_frame_count > 120:
+                print("No frames available, breaking connection")
+                break
+            time.sleep(0.008)
+
+# Control --------------------------------------------------------------------
+
+@app.route("/start", methods=["POST"])
+def _start_stream():
+    global streaming_active
+    if streaming_active:
+        return jsonify({"success": "MJPEG stream already running"}), 200
     
     try:
         streaming_active = True
+        _start_ffmpeg()
         
-        # Start FFmpeg process
-        _start_ffmpeg_process()
+        time.sleep(2)  # Wait for FFmpeg to start
         
-        # Wait and check if process is alive
-        print(f"FFmpeg process started with PID {ffmpeg_process.pid}")
-        time.sleep(2)
-        
-        poll_result = ffmpeg_process.poll()
-        print(f"FFmpeg poll result: {poll_result}")
-        
-        if poll_result is None:
-            # Start monitor thread
-            monitor_thread = threading.Thread(target=monitor_ffmpeg, daemon=True)
-            monitor_thread.start()
-            
-            print(f"OBS Virtual Camera started successfully with PID {ffmpeg_process.pid}")
-            print(f"FFmpeg logs available at: /tmp/ffmpeg_output.log")
-        else:
-            # Process died, get error
-            stdout_data = ""
-            stderr_data = ""
-            
-            try:
-                stdout_data, stderr_data = ffmpeg_process.communicate(timeout=1)
-                stdout_data = stdout_data.decode() if stdout_data else ""
-                stderr_data = stderr_data.decode() if stderr_data else ""
-            except subprocess.TimeoutExpired:
-                print("Timeout reading FFmpeg output")
-            
-            print(f"FFmpeg STDOUT: {stdout_data}")
-            print(f"FFmpeg STDERR: {stderr_data}")
-            
-            ffmpeg_process = None
-            streaming_active = False
-            raise Exception(f"OBS Virtual Camera failed to start. Exit code: {poll_result}. Error: {stderr_data}")
-        
-    except Exception as e:
-        print(f"Failed to start OBS Virtual Camera: {e}")
-        streaming_active = False
-        ffmpeg_process = None
-        raise e
-
-def stop_ffmpeg_stream():
-    """Stop FFmpeg stream"""
-    global ffmpeg_process, streaming_active, frame_reader_thread, monitor_thread, stderr_reader_thread, latest_frame
-    
-    streaming_active = False
-    
-    # Stop monitor thread
-    if monitor_thread and monitor_thread.is_alive():
-        monitor_thread.join(timeout=2)
-    monitor_thread = None
-    
-    # Stop FFmpeg process
-    if ffmpeg_process:
-        try:
-            os.killpg(os.getpgid(ffmpeg_process.pid), signal.SIGTERM)
-            ffmpeg_process.wait(timeout=5)
-        except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
-            try:
-                os.killpg(os.getpgid(ffmpeg_process.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-        ffmpeg_process = None
-    
-    # Wait for threads to finish
-    if frame_reader_thread and frame_reader_thread.is_alive():
-        frame_reader_thread.join(timeout=3)
-    if stderr_reader_thread and stderr_reader_thread.is_alive():
-        stderr_reader_thread.join(timeout=3)
-    
-    frame_reader_thread = None
-    stderr_reader_thread = None
-    
-    with frame_lock:
-        latest_frame = None
-    
-    print("Stopped FFmpeg stream")
-
-# Add new route to view FFmpeg logs
-@app.route('/ffmpeg/logs')
-def ffmpeg_logs():
-    """Get recent FFmpeg logs"""
-    try:
-        with open('/tmp/ffmpeg_output.log', 'r') as f:
-            # Get last 100 lines
-            lines = f.readlines()
-            recent_lines = lines[-100:] if len(lines) > 100 else lines
-            return {
-                "logs": ''.join(recent_lines),
-                "total_lines": len(lines)
-            }, 200
-    except FileNotFoundError:
-        return {"logs": "No logs available yet", "total_lines": 0}, 200
-    except Exception as e:
-        return {"error": f"Failed to read logs: {e}"}, 500
-
-# ...rest of your existing routes stay the same...
-
-def generate_frames():
-    """Generate MJPEG frames from buffered frames - supports multiple clients"""
-    global latest_frame
-    
-    if not streaming_active:
-        return
-    
-    no_frame_count = 0
-    
-    while streaming_active:
-        try:
-            with frame_lock:
-                current_frame = latest_frame
-            
-            if current_frame:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n'
-                       b'Content-Length: ' + str(len(current_frame)).encode() + b'\r\n'
-                       b'\r\n' + current_frame + b'\r\n')
-                
-                no_frame_count = 0
-                time.sleep(1/60)
-            else:
-                no_frame_count += 1
-                if no_frame_count > 120:
-                    print("No frames available, breaking connection")
-                    break
-                time.sleep(0.008)
-                    
-        except Exception as e:
-            print(f"Frame generation error: {e}")
-            break
-    
-    print("Frame generation stopped")
-
-@app.route('/stream')
-def stream():
-    """MJPEG stream endpoint"""
-    if not streaming_active:
-        start_ffmpeg_stream()
-        time.sleep(1)
-        
-        if not streaming_active:
-            return {"error": "Streaming is not active"}, 503
-    
-    return Response(
-        generate_frames(),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
-
-@app.route('/start', methods=['POST'])
-def start():
-    """Start streaming"""
-    try:
-        start_ffmpeg_stream()
-        time.sleep(2)
-        if streaming_active:
+        if ffmpeg_process and ffmpeg_process.poll() is None:
             response_data = {
                 "active": True,
                 "streaming": streaming_active,
                 "camera_type": "real",
                 "clients": 0,
-                "stream_url": f"{get_base_url()}/stream",
-                "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None
+                "stream_url": f"{_base_url()}/stream",
+                "ffmpeg_pid": ffmpeg_process.pid
             }
-            return {
-                "success": "MJPEG stream started",
-                "data": response_data
-            }, 200
+            return jsonify({"success": "MJPEG stream started", "data": response_data}), 200
         else:
-            return {
-                "error": "Failed to start stream - streaming not active after start attempt"
-            }, 500
+            streaming_active = False
+            return jsonify({"error": "Failed to start stream"}), 500
+            
     except Exception as e:
-        return {
-            "error": f"Failed to start stream: {str(e)}"
-        }, 500
+        streaming_active = False
+        return jsonify({"error": f"Failed to start stream: {str(e)}"}), 500
 
-@app.route('/stop', methods=['POST'])
-def stop():
-    """Stop streaming"""
-    stop_ffmpeg_stream()
-    return {
-        "success": "MJPEG stream stopped"
-    }, 200
+@app.route("/stop", methods=["POST"])
+def _stop_stream():
+    global streaming_active
+    streaming_active = False
+    _stop_ffmpeg()
+    return jsonify({"success": "MJPEG stream stopped"}), 200
 
-@app.route('/status')
-def status():
-    """Get streaming status"""
+# Status / health ------------------------------------------------------------
+
+@app.route("/status")
+def _status():
     status_data = {
         "active": streaming_active,
         "streaming": streaming_active,
         "camera_type": "real",
         "clients": 0,
-        "stream_url": f"{get_base_url()}/stream" if streaming_active else None,
+        "stream_url": f"{_base_url()}/stream" if streaming_active else None,
         "ffmpeg_pid": ffmpeg_process.pid if ffmpeg_process else None,
         "error": None
     }
-    return {
-        "data": status_data
-    }, 200
+    
+    if DETECTION_AVAILABLE:
+        try:
+            detection_status = get_detection_status()
+            detection_status["available"] = True
+            status_data["detection"] = detection_status
+        except Exception as e:
+            status_data["detection"] = {"available": False, "error": str(e)}
+    
+    return jsonify({"data": status_data}), 200
 
-@app.route('/health')
-def health():
-    """Health check endpoint"""
+@app.route("/health")
+def _health():
     health_data = {
         "status": "healthy",
         "service": "mjpeg-streaming", 
         "timestamp": time.time()
     }
-    return {
-        "data": health_data
-    }, 200
+    return jsonify({"data": health_data}), 200
 
-# NEW: Detection control routes
-@app.route('/detection/toggle', methods=['POST'])
-def toggle_detection_route():
-    """Toggle motion detection on/off"""
+# Detection control routes ---------------------------------------------------
+
+@app.route("/detection/toggle", methods=["POST"])
+def _det_toggle():
     if not DETECTION_AVAILABLE:
-        return {"error": "Detection not available"}, 503
+        return jsonify({"error": "Detection not available"}), 503
     
     try:
-        enabled = request.json.get('enabled', True)
+        enabled = request.json.get("enabled", True)
         result = toggle_detection(enabled)
-        return {"success": f"Detection {'enabled' if result else 'disabled'}"}, 200
+        return jsonify({"success": f"Detection {'enabled' if result else 'disabled'}"}), 200
     except Exception as e:
-        return {"error": f"Failed to toggle detection: {e}"}, 500
+        return jsonify({"error": f"Failed to toggle detection: {e}"}), 500
 
-@app.route('/detection/status')
-def detection_status():
-    """Get detection status"""
+@app.route("/detection/status")
+def _det_status():
     if not DETECTION_AVAILABLE:
-        return {"data": {"available": False, "error": "Detection module not loaded"}}, 200
+        return jsonify({"data": {"available": False, "error": "Detection module not loaded"}}), 200
     
     try:
         status = get_detection_status()
         status["available"] = True
-        return {"data": status}, 200
+        return jsonify({"data": status}), 200
     except Exception as e:
-        return {"error": f"Failed to get status: {e}"}, 500
+        return jsonify({"error": f"Failed to get status: {e}"}), 500
 
-@app.route('/detection/logs')
-def detection_logs():
-    """Get recent detection logs"""
+@app.route("/detection/logs")
+def _det_logs():
     if not DETECTION_AVAILABLE:
-        return {"error": "Detection not available"}, 503
+        return jsonify({"error": "Detection not available"}), 503
     
     try:
         log_file = "motion_logs/events.jsonl"
         if not os.path.exists(log_file):
-            return {"data": {"events": [], "count": 0}}, 200
+            return jsonify({"data": {"events": [], "count": 0}}), 200
         
         with open(log_file, 'r') as f:
             lines = f.readlines()
@@ -579,59 +415,75 @@ def detection_logs():
         events = []
         for line in recent_lines:
             try:
-                events.append(json.loads(line.strip()))  # Use json.loads instead of eval
+                events.append(json.loads(line.strip()))
             except (json.JSONDecodeError, ValueError):
                 continue
         
-        return {"data": {"events": events, "count": len(events)}}, 200
+        return jsonify({"data": {"events": events, "count": len(events)}}), 200
     except Exception as e:
-        return {"error": f"Failed to get logs: {e}"}, 500
+        return jsonify({"error": f"Failed to get logs: {e}"}), 500
 
-@app.route('/detection/refresh-strip', methods=['POST'])
-def refresh_detection_strip():
-    """Manually refresh the detection strip"""
+@app.route("/detection/refresh-strip", methods=["POST"])
+def _det_refresh():
     if not DETECTION_AVAILABLE:
-        return {"error": "Detection not available"}, 503
+        return jsonify({"error": "Detection not available"}), 503
     
     try:
         result = refresh_film_strip()
-        if result["success"]:
-            return {"success": result["message"]}, 200
+        if result.get("success"):
+            return jsonify({"success": result["message"]}), 200
         else:
-            return {"error": result["error"]}, 500
+            return jsonify({"error": result.get("error", "Unknown error")}), 500
     except Exception as e:
-        return {"error": f"Failed to refresh detection strip: {e}"}, 500
+        return jsonify({"error": f"Failed to refresh detection strip: {e}"}), 500
 
-# NEW: Test endpoint for film strip generation
-@app.route('/detection/test-strip', methods=['POST'])
-def test_detection_strip():
-    """Test the film strip generation with current detection images"""
+@app.route("/detection/test-strip", methods=["POST"])
+def _det_test():
     if not DETECTION_AVAILABLE:
-        return {"error": "Detection not available"}, 503
+        return jsonify({"error": "Detection not available"}), 503
     
     try:
-        # Create the strip
         create_detections_strip()
-        
-        # Get current status
         status = get_detection_status()
         
-        return {
+        return jsonify({
             "success": "Film strip generated successfully", 
             "data": {
-                "strip_file": "motion_logs/detections_strip.png",
+                "strip_file": "motion_logs/detections_strip.jpg",  # Fixed: Changed from PNG to JPG
                 "film_strip_info": status.get("film_strip", {}),
-                "message": "Check the detection strip PNG image to see the optimized transparent layout"
+                "message": "Check the detection strip JPG image"  # Updated message
             }
-        }, 200
+        }), 200
     except Exception as e:
-        return {"error": f"Failed to generate test strip: {e}"}, 500
+        return jsonify({"error": f"Failed to generate test strip: {e}"}), 500
 
-if __name__ == '__main__':
-    print("Starting FFmpeg MJPEG service with detection on port 8081")
+# Add FFmpeg logs route for debugging
+@app.route('/ffmpeg/logs')
+def _ffmpeg_logs():
+    """Get recent FFmpeg logs"""
+    try:
+        with open('/tmp/ffmpeg_output.log', 'r') as f:
+            lines = f.readlines()
+            recent_lines = lines[-100:] if len(lines) > 100 else lines
+            return jsonify({
+                "logs": ''.join(recent_lines),
+                "total_lines": len(lines)
+            }), 200
+    except FileNotFoundError:
+        return jsonify({"logs": "No logs available yet", "total_lines": 0}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to read logs: {e}"}), 500
+
+###############################################################################
+# Dev entry-point (use gunicorn in production)
+###############################################################################
+
+if __name__ == "__main__":
+    print("Starting FFmpeg MJPEG service with detection on port 8080")
     if DETECTION_AVAILABLE:
         print("Motion detection auto-enabled - cat detection and smart cropping active")
         print("Cropped detections will be saved to: motion_logs/crops/")
+        print("Detection strip will be saved to: motion_logs/detections_strip.jpg")
     else:
         print("Detection module not available - streaming only")
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host="0.0.0.0", port=8080, debug=False)

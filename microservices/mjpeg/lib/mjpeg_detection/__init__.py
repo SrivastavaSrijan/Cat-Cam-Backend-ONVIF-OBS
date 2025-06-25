@@ -2,7 +2,7 @@
 Detection and motion processing modules.
 """
 
-from .motion_processor import (
+from .detection_service import (
     init_detection,
     detect_cats,
     detect_motion,
