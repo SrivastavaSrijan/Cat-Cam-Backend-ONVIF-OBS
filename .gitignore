@@ -32,8 +32,8 @@ motion_logs/
 
 # YOLO models
 models/
-yolo8m.pt
-yolo8l.pt
+yolov8m.pt
+yolov8l.pt
 
 # IDE
 .idea/
