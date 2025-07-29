@@ -483,4 +483,7 @@ if __name__ == "__main__":
         print("Detection module not available - streaming only")
         print("Cropped detections will be saved to: motion_logs/crops/")
         print("Detection strip will be saved to: motion_logs/detections_strip.jpg")
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    
+    # Check if running under supervisor (production mode)
+    debug_mode = os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host="0.0.0.0", port=8080, debug=debug_mode)
