@@ -1,0 +1,43 @@
+version: "3.8"
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    expose:
+      - "5000"  # Changed from ports to expose (internal only)
+    volumes:
+      - ./backend:/app
+    environment:
+      - EXTERNAL_DOMAIN=ssvcam.srijansrivastava.com  # Updated domain
+    depends_on:
+      - frontend
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    expose:
+      - "80"  # Changed from ports to expose (internal only)
+    volumes:
+      - ./frontend:/app
+    environment:
+      - REACT_APP_API_BASE_URL=https://ssvcam.srijansrivastava.com/api  # Updated to HTTPS
+
+volumes:
+  caddy_data:
+  caddy_config:
